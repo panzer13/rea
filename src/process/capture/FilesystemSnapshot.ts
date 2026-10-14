@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, readdir, readlink } from "node:fs/promises";
+import { lstat, open, opendir, readlink } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import type { FileHandle } from "node:fs/promises";
 import type { ProcessScenario } from "../../domain/process/processScenario.js";
@@ -74,12 +74,14 @@ export const hashFile = async (
   signal?: AbortSignal,
 ): Promise<FileHashOutcome> => {
   signal?.throwIfAborted();
+  const noFollowAvailable =
+    typeof fsConstants.O_NOFOLLOW === "number" && fsConstants.O_NOFOLLOW !== 0;
   let handle: FileHandle;
   try {
     handle = await open(
       path,
       fsConstants.O_RDONLY |
-        (fsConstants.O_NOFOLLOW ?? 0) |
+        (noFollowAvailable ? fsConstants.O_NOFOLLOW : 0) |
         (fsConstants.O_NONBLOCK ?? 0),
     );
   } catch (cause: unknown) {
@@ -94,6 +96,18 @@ export const hashFile = async (
   }
   try {
     signal?.throwIfAborted();
+    // On hosts without O_NOFOLLOW, compare the leaf's identity with the
+    // captured regular file. Ancestor aliases do not change file identity.
+    if (!noFollowAvailable) {
+      const named = await lstat(path);
+      signal?.throwIfAborted();
+      if (!hasSameFileState(expected, named))
+        return {
+          state: "omitted",
+          reason: "file_changed_or_short_read",
+          system_code: null,
+        };
+    }
     const stats = await handle.stat();
     signal?.throwIfAborted();
     if (!hasSameFileState(expected, stats) || stats.size > maxBytes)
@@ -124,7 +138,13 @@ export const hashFile = async (
     }
     const after = await handle.stat();
     signal?.throwIfAborted();
-    if (!hasSameFileState(stats, after))
+    let unchanged = hasSameFileState(stats, after);
+    if (unchanged && !noFollowAvailable) {
+      const namedAfter = await lstat(path);
+      signal?.throwIfAborted();
+      unchanged = hasSameFileState(after, namedAfter);
+    }
+    if (!unchanged)
       return {
         state: "omitted",
         reason: "file_changed_or_short_read",
@@ -153,10 +173,12 @@ export const snapshotRoots = async (
   const entries: FileState[] = [];
   const completeRoots: string[] = [];
   let remainingBytes = scenario.limits.file_bytes;
+  let pendingNames = 0;
   let truncated = false;
   const enumerationReasons = new Set<
     FilesystemCoverage["enumeration_reasons"][number]
   >();
+  const enumerationOmissions: FilesystemCoverage["enumeration_omissions"] = [];
   const hashOmissions: FilesystemCoverage["hash_omissions"] = [];
   const visit = async (
     root: string,
@@ -247,15 +269,56 @@ export const snapshotRoots = async (
       symlink_target: null,
     });
     if (type !== "directory") return true;
-    const children = await readdir(path);
+    const children: string[] = [];
+    let complete = true;
+    const remainingEntries =
+      scenario.limits.files - entries.length - pendingNames;
+    let directory;
+    try {
+      directory = await opendir(path);
+    } catch (cause: unknown) {
+      signal?.throwIfAborted();
+      const systemCode = fileUnavailableSystemCode(cause);
+      if (systemCode === undefined) throw cause;
+      truncated = true;
+      complete = false;
+      enumerationReasons.add("directory_unavailable");
+      enumerationOmissions.push({
+        path: `${rootAlias}:${relativePath}`,
+        reason: "directory_unavailable",
+        system_code: systemCode,
+      });
+      return false;
+    }
+    for await (const child of directory) {
+      signal?.throwIfAborted();
+      if (
+        children.length >= remainingEntries ||
+        depth >= scenario.limits.filesystem_depth
+      ) {
+        truncated = true;
+        complete = false;
+        if (children.length >= remainingEntries)
+          enumerationReasons.add("files_limit");
+        if (depth >= scenario.limits.filesystem_depth)
+          enumerationReasons.add("depth_limit");
+        break;
+      }
+      children.push(child.name);
+      pendingNames += 1;
+    }
     const afterRead = await lstat(path);
     if (!hasSameIdentity(stats, afterRead, "directory")) {
+      pendingNames -= children.length;
       truncated = true;
       enumerationReasons.add("identity_changed");
       return false;
     }
-    let complete = true;
-    for (const child of children.sort()) {
+    children.sort().reverse();
+    while (children.length > 0) {
+      const child = children.pop();
+      if (child === undefined) break;
+      pendingNames -= 1;
       if (!(await visit(root, rootAlias, join(path, child), depth + 1)))
         complete = false;
     }
@@ -279,6 +342,7 @@ export const snapshotRoots = async (
       enumeration_truncated:
         completeRoots.length !== scenario.filesystem_observation_paths.length,
       enumeration_reasons: [...enumerationReasons],
+      enumeration_omissions: enumerationOmissions,
       hash_budget_bytes: scenario.limits.file_bytes,
       hashed_bytes: scenario.limits.file_bytes - remainingBytes,
       hash_omissions: hashOmissions,

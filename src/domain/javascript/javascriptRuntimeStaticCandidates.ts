@@ -1,7 +1,11 @@
-import { posix, relative, win32 } from "node:path";
+import { posix, win32 } from "node:path";
 
 import type { ApplicationNode } from "./javascriptApplicationGraphSchemas.js";
 import type { JavaScriptApplicationGraph } from "./javascriptApplicationGraph.js";
+import {
+  logicalPathEscapesRoot,
+  normalizeJoinedLogicalPath,
+} from "../artifactIdentity.js";
 import { uniqueSorted } from "../canonicalOrdering.js";
 import { compareUnicodeCodePoints } from "../unicodeCodePointOrder.js";
 import type { ParsedStaticLayer } from "./javascriptRuntimeReconciliationParsing.js";
@@ -12,6 +16,12 @@ export interface StaticRuntimeCandidate {
   readonly node: ApplicationNode;
   readonly category: "renderer" | "javascript" | "worker" | "service-worker";
   readonly paths: readonly string[];
+  readonly nativeDeclarationPaths: Readonly<
+    Record<
+      "posix" | "windows",
+      readonly { readonly path: string; readonly sourcePath: string | null }[]
+    >
+  >;
   readonly digests: readonly {
     readonly sha256: string;
     readonly basis: "content-sha256" | "module-source-sha256";
@@ -20,6 +30,9 @@ export interface StaticRuntimeCandidate {
 
 export interface MappedRuntimePath {
   readonly path: string;
+  readonly fileStyle: "posix" | "windows" | null;
+  readonly nativeRelativePath: string | null;
+  readonly artifactPrefix: string;
   readonly basis:
     | "artifact-path"
     | "operator-file-mapping"
@@ -50,9 +63,20 @@ export const mappedRuntimePaths = (
   entity: RuntimeReconciliationEntity,
 ): MappedRuntimePath[] => {
   const paths: MappedRuntimePath[] = [];
+  const fileStyle =
+    entity.location.kind === "file"
+      ? absoluteFilePathStyle(entity.location.value)
+      : null;
   if (entity.location.kind === "file" && layer.result.format === "directory") {
     const path = pathBelowRoot(layer.result.input_path, entity.location.value);
-    if (path !== null) paths.push({ path, basis: "artifact-path" });
+    if (path !== null)
+      paths.push({
+        path,
+        fileStyle,
+        nativeRelativePath: path,
+        artifactPrefix: "",
+        basis: "artifact-path",
+      });
   }
   for (const mapping of layer.runtimeMappings) {
     const suffix =
@@ -66,6 +90,9 @@ export const mappedRuntimePaths = (
     if (path === null) continue;
     paths.push({
       path,
+      fileStyle,
+      nativeRelativePath: mapping.kind === "file-root" ? suffix : null,
+      artifactPrefix: normalizeArtifactPrefix(mapping.artifact_prefix),
       basis:
         mapping.kind === "file-root"
           ? "operator-file-mapping"
@@ -107,6 +134,7 @@ const candidatesForLayer = (
         node,
         category,
         paths: pathsByNodeId.get(node.node_id) ?? [],
+        nativeDeclarationPaths: nativeDeclarationPaths(node),
         digests: candidateDigests(node),
       },
     ];
@@ -153,7 +181,9 @@ const indexStaticPaths = (
       node.node_id,
       uniqueSorted([
         ...nodePaths(node),
-        ...(relatedBySource.get(node.node_id) ?? []).flatMap(nodePaths),
+        ...(usesApplicationFileDeclaration(node)
+          ? []
+          : (relatedBySource.get(node.node_id) ?? []).flatMap(nodePaths)),
       ]),
     ]),
   );
@@ -164,9 +194,21 @@ const nodePaths = (node: ApplicationNode): string[] => {
   if (node.identity.strategy === "canonical-path")
     paths.push(node.identity.path);
   for (const observation of node.observations) {
-    for (const property of ["path", "resolved_path", "declared_path"])
-      if (typeof observation.properties[property] === "string")
-        paths.push(observation.properties[property]);
+    const rawApplicationFile =
+      node.kind === "electron-renderer" &&
+      isRawApplicationFileObservation(observation);
+    if (typeof observation.properties.path === "string")
+      paths.push(observation.properties.path);
+    if (rawApplicationFile) continue;
+    if (typeof observation.properties.resolved_path === "string")
+      paths.push(observation.properties.resolved_path);
+    const declaration = observation.properties.declared_path;
+    if (
+      !hasOwnedArtifactPath(node) &&
+      typeof declaration === "string" &&
+      !declaration.includes("\\")
+    )
+      paths.push(declaration);
     if (
       observation.evidence.location.available &&
       observation.evidence.location.value.kind === "artifact-path"
@@ -174,10 +216,99 @@ const nodePaths = (node: ApplicationNode): string[] => {
       paths.push(observation.evidence.location.value.path);
   }
   return paths
-    .map(normalizeArtifactPath)
+    .map(relativeLogicalPath)
     .filter(
       (path): path is string => path !== null && path !== "artifact-root",
     );
+};
+
+// Raw filesystem expressions have host syntax only when a captured file location
+// establishes that format. Genuinely owned artifact facts take precedence.
+const hasOwnedArtifactPath = (node: ApplicationNode): boolean =>
+  node.identity.strategy === "canonical-path" ||
+  node.observations.some(
+    ({ properties }) => typeof properties.path === "string",
+  ) ||
+  node.observations.some(
+    (observation) =>
+      !isRawApplicationFileObservation(observation) &&
+      typeof observation.properties.resolved_path === "string",
+  );
+
+// loadFile receives a raw literal here: the syntax producer does not retain
+// computed __dirname expressions. Electron resolves this relative to the app
+// root, so its source-relative inference is not an owned runtime target.
+const isRawApplicationFileObservation = (
+  observation: ApplicationNode["observations"][number],
+): boolean =>
+  observation.properties.resolution_context === "filesystem-expression" &&
+  typeof observation.properties.mechanism === "string" &&
+  observation.properties.mechanism.startsWith("call:") &&
+  observation.properties.mechanism.endsWith("loadFile");
+
+const usesApplicationFileDeclaration = (node: ApplicationNode): boolean =>
+  node.kind === "electron-renderer" &&
+  !hasOwnedArtifactPath(node) &&
+  node.observations.some(isRawApplicationFileObservation);
+
+const nativeDeclarationPaths = (
+  node: ApplicationNode,
+): StaticRuntimeCandidate["nativeDeclarationPaths"] => {
+  if (hasOwnedArtifactPath(node)) return { posix: [], windows: [] };
+  const declarations = node.observations.flatMap((observation) => {
+    const { properties } = observation;
+    return properties.resolution_context === "filesystem-expression" &&
+      typeof properties.declared_path === "string" &&
+      (isRawApplicationFileObservation(observation) ||
+        properties.declared_path.includes("\\"))
+      ? [
+          {
+            path: properties.declared_path,
+            sourcePath: nativeDeclarationSource(observation),
+          },
+        ]
+      : [];
+  });
+  const normalized = (windows: boolean) => {
+    const values = declarations.flatMap(({ path, sourcePath }) => {
+      if (windows && (win32.isAbsolute(path) || /^[a-z]:/iu.test(path)))
+        return [];
+      const normalizedPath = relativeLogicalPath(
+        windows ? path.replaceAll("\\", "/") : path,
+      );
+      return normalizedPath === null
+        ? []
+        : [{ path: normalizedPath, sourcePath }];
+    });
+    return [
+      ...new Map(
+        values.map((value) => [JSON.stringify(value), value]),
+      ).values(),
+    ].sort(
+      (left, right) =>
+        compareUnicodeCodePoints(left.path, right.path) ||
+        compareUnicodeCodePoints(left.sourcePath ?? "", right.sourcePath ?? ""),
+    );
+  };
+  return { posix: normalized(false), windows: normalized(true) };
+};
+
+// A source anchor constrains the selected application namespace; it does not
+// supply a module-relative base for the raw filesystem declaration.
+const nativeDeclarationSource = (
+  observation: ApplicationNode["observations"][number],
+): string | null => {
+  const location = observation.evidence.location;
+  if (!location.available) return null;
+  const source =
+    location.value.kind === "source-range"
+      ? location.value.source
+      : location.value.kind === "artifact-path"
+        ? location.value.path
+        : null;
+  return source === null || source === "artifact-root"
+    ? null
+    : relativeLogicalPath(source);
 };
 
 const candidateDigests = (
@@ -212,8 +343,9 @@ const pathBelowRoot = (root: string, value: string): string | null => {
   const remainder =
     rootStyle === "windows"
       ? win32.relative(root, value)
-      : relative(root, value);
-  const portableRemainder = remainder.replaceAll("\\", "/");
+      : posix.relative(root, value);
+  const portableRemainder =
+    rootStyle === "windows" ? remainder.replaceAll("\\", "/") : remainder;
   if (
     remainder === "" ||
     (rootStyle === "windows" && win32.isAbsolute(remainder)) ||
@@ -221,7 +353,7 @@ const pathBelowRoot = (root: string, value: string): string | null => {
     portableRemainder.startsWith("../")
   )
     return null;
-  return normalizeArtifactPath(portableRemainder);
+  return relativeLogicalPath(portableRemainder);
 };
 
 const absoluteFilePathStyle = (path: string): "posix" | "windows" | null => {
@@ -250,7 +382,7 @@ const pathBelowUrlPrefix = (prefix: string, value: string): string | null => {
   )
     return null;
   try {
-    return normalizeArtifactPath(
+    return relativeLogicalPath(
       decodeURIComponent(candidate.pathname.slice(base.pathname.length)),
     );
   } catch (cause: unknown) {
@@ -284,25 +416,25 @@ const activeArtifactPrefixes = (
             : false,
       )
     )
-      prefixes.add(mapping.artifact_prefix);
+      prefixes.add(normalizeArtifactPrefix(mapping.artifact_prefix));
   return [...prefixes].sort(compareUnicodeCodePoints);
 };
+
+const normalizeArtifactPrefix = (prefix: string): string =>
+  prefix === "" ? "" : normalizeJoinedLogicalPath(prefix);
 
 const pathWithinPrefix = (path: string, prefix: string): boolean =>
   prefix === "" || path === prefix || path.startsWith(`${prefix}/`);
 
 const safeArtifactPath = (prefix: string, suffix: string): string | null =>
-  normalizeArtifactPath(prefix === "" ? suffix : posix.join(prefix, suffix));
+  relativeLogicalPath(prefix === "" ? suffix : posix.join(prefix, suffix));
 
-const normalizeArtifactPath = (value: string): string | null => {
-  const normalized = posix
-    .normalize(value.replaceAll("\\", "/"))
-    .replace(/^\.\//u, "");
+const relativeLogicalPath = (value: string): string | null => {
+  // These are artifact names or already parsed runtime paths, not declarations.
+  const normalized = normalizeJoinedLogicalPath(value);
   return normalized !== "" &&
     normalized !== "." &&
-    normalized !== ".." &&
-    !normalized.startsWith("/") &&
-    !normalized.startsWith("../")
+    !logicalPathEscapesRoot(normalized)
     ? normalized
     : null;
 };
@@ -312,10 +444,24 @@ const uniqueMappedPaths = (
 ): MappedRuntimePath[] =>
   [
     ...new Map(
-      values.map((value) => [`${value.basis}:${value.path}`, value]),
+      values.map((value) => [
+        JSON.stringify([
+          value.basis,
+          value.path,
+          value.fileStyle,
+          value.nativeRelativePath,
+          value.artifactPrefix,
+        ]),
+        value,
+      ]),
     ).values(),
   ].sort(
     (left, right) =>
       compareUnicodeCodePoints(left.path, right.path) ||
-      compareUnicodeCodePoints(left.basis, right.basis),
+      compareUnicodeCodePoints(left.basis, right.basis) ||
+      compareUnicodeCodePoints(
+        left.nativeRelativePath ?? "",
+        right.nativeRelativePath ?? "",
+      ) ||
+      compareUnicodeCodePoints(left.artifactPrefix, right.artifactPrefix),
   );

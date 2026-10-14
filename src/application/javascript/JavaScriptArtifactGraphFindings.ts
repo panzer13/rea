@@ -12,7 +12,6 @@ import {
   javascriptAnalysisCoverage,
   linkElectronRoleToAsset,
   moduleLookupKey,
-  resolveArtifactPath,
   selfReferenceOmissions,
   sourceNodeFor,
   type JavaScriptArtifactGraphContext,
@@ -22,7 +21,12 @@ import {
   astObservationEvidence,
   staticInferenceEvidence,
 } from "./JavaScriptArtifactGraphEvidence.js";
-import { resolveArtifactPathByContext } from "./JavaScriptArtifactPathResolution.js";
+import {
+  artifactPathResolutionProperties,
+  resolveArtifactPathByContext,
+  type ArtifactPathResolution,
+} from "./JavaScriptArtifactPathResolution.js";
+import { moduleResolutionModeForJavaScriptReference } from "../../domain/javascript/javascriptModuleResolutionMode.js";
 
 type StaticReference = JavaScriptStaticAnalysis["references"][number];
 type StaticEndpoint = JavaScriptStaticAnalysis["endpoints"][number];
@@ -38,17 +42,21 @@ interface FindingInput<Value> {
 }
 
 interface ResolvedReference {
-  readonly path: string;
-  readonly file: JavaScriptArtifactFile;
-  readonly node: ApplicationNode;
+  readonly path: string | null;
+  readonly file: JavaScriptArtifactFile | null;
+  readonly node: ApplicationNode | null;
+  readonly limitations: readonly string[];
+  readonly resolutionStatus?: string;
+  readonly resolution?: ArtifactPathResolution;
 }
 
 /** Project imports, workers, roles, endpoints, storage, and source-map links. */
-export const addJavaScriptStaticFindings = (
+export function* addJavaScriptStaticFindingsSteps(
   context: JavaScriptArtifactGraphContext,
-): readonly string[] => {
+): Generator<void, readonly string[]> {
   const omissions = { selfReferences: 0 };
   for (const analyzed of context.analysis.files) {
+    yield;
     const { file, javascript } = analyzed;
     const asset = context.assetNodes.get(file.path);
     if (javascript === null || asset === undefined) continue;
@@ -69,7 +77,7 @@ export const addJavaScriptStaticFindings = (
     ["static reference", "static references"],
     "the referencing module",
   );
-};
+}
 
 const addReference = (
   context: JavaScriptArtifactGraphContext,
@@ -77,12 +85,16 @@ const addReference = (
   omissions: { selfReferences: number },
 ): void => {
   const source =
-    sourceNodeFor(context, input.file.path, input.value.module_key) ??
-    input.asset;
+    sourceNodeFor(
+      context,
+      input.file.path,
+      input.value.module_key,
+      input.value.module_runtime,
+    ) ?? input.asset;
   const resolved =
     input.value.specifier === null
       ? null
-      : resolveReference(context, input.file.path, input.value);
+      : resolveReference(context, input.file.path, input.value, input.coverage);
   if (input.value.kind === "worker" || input.value.kind === "service-worker") {
     const worker = context.accumulator.addNode({
       kind: input.value.kind === "worker" ? "worker" : "service-worker",
@@ -98,6 +110,8 @@ const addReference = (
             declared_specifier: input.value.specifier,
             expression: input.value.expression,
             resolved_path: resolved?.path ?? null,
+            resolution_status: resolved?.resolutionStatus ?? null,
+            ...artifactPathResolutionProperties(resolved?.resolution),
           },
           evidence: staticInferenceEvidence({
             sha256: input.file.sha256,
@@ -105,6 +119,7 @@ const addReference = (
             range: input.value.location,
             operation: "discover-worker",
             coverage: input.coverage,
+            limitations: resolved?.limitations ?? [],
           }),
         },
       ],
@@ -116,9 +131,14 @@ const addReference = (
       range: input.value.location,
       coverage: input.coverage,
       relation: "loads",
-      properties: { kind: input.value.kind },
+      properties: {
+        kind: input.value.kind,
+        resolution_status: resolved?.resolutionStatus ?? null,
+        ...artifactPathResolutionProperties(resolved?.resolution),
+      },
+      limitations: resolved?.limitations ?? [],
     });
-    if (resolved !== null)
+    if (resolved !== null && resolved.path !== null && resolved.node !== null)
       addStaticInferenceEdge(context, {
         source: worker,
         target: resolved.node,
@@ -127,13 +147,14 @@ const addReference = (
         coverage: input.coverage,
         relation: "maps_to",
         properties: { resolved_path: resolved.path },
+        limitations: resolved.limitations,
       });
     return;
   }
   // A reference that resolves to its own source, such as a bundled module
   // requiring its own key, cannot become an edge: the application graph
   // forbids self-referential edges and one would fail the whole analysis.
-  if (resolved?.node.node_id === source.node_id) {
+  if (resolved?.node?.node_id === source.node_id) {
     omissions.selfReferences += 1;
     return;
   }
@@ -146,13 +167,25 @@ const addReference = (
     file: input.file,
     range: input.value.location,
     coverage: input.coverage,
-    relation: resolved?.file.kind === "native-addon" ? "loads" : "imports",
+    relation: resolved?.file?.kind === "native-addon" ? "loads" : "imports",
     properties: {
       kind: input.value.kind,
       specifier: input.value.specifier,
       expression: input.value.expression,
+      resolution_mode:
+        input.value.kind === "static-import" ||
+        input.value.kind === "dynamic-import" ||
+        input.value.kind === "require"
+          ? moduleResolutionModeForJavaScriptReference(
+              input.file.path,
+              input.value.kind,
+            )
+          : null,
       resolved_path: resolved?.path ?? null,
+      resolution_status: resolved?.resolutionStatus ?? null,
+      ...artifactPathResolutionProperties(resolved?.resolution),
     },
+    ...(resolved === null ? {} : { limitations: resolved.limitations }),
   });
 };
 
@@ -161,8 +194,12 @@ const addEndpoint = (
   input: FindingInput<StaticEndpoint>,
 ): void => {
   const source =
-    sourceNodeFor(context, input.file.path, input.value.module_key) ??
-    input.asset;
+    sourceNodeFor(
+      context,
+      input.file.path,
+      input.value.module_key,
+      input.value.module_runtime,
+    ) ?? input.asset;
   const key = compactStringIdentityKey(input.value.value);
   const label = `${input.value.kind} endpoint`;
   const node = context.accumulator.addNode({
@@ -203,8 +240,12 @@ const addStorage = (
   input: FindingInput<StaticStorage>,
 ): void => {
   const source =
-    sourceNodeFor(context, input.file.path, input.value.module_key) ??
-    input.asset;
+    sourceNodeFor(
+      context,
+      input.file.path,
+      input.value.module_key,
+      input.value.module_runtime,
+    ) ?? input.asset;
   const node = context.accumulator.addNode({
     kind: "storage",
     identity: artifactLocalIdentity(
@@ -250,6 +291,16 @@ const addDiscoveredRole = (
     sourcePath: input.file.path,
     context: input.value.resolution_context,
     files: context.filesByPath,
+    directoryPaths: context.directoryPaths,
+    unanalyzedFiles: context.unanalyzedFiles,
+    ...(input.value.role === "preload" ||
+    (input.value.role === "renderer" &&
+      input.value.resolution_context === "filesystem-expression")
+      ? { runtimePathKind: "exact-file" as const }
+      : input.value.role === "renderer" &&
+          input.value.resolution_context === "module-specifier"
+        ? { runtimePathKind: "url-resource" as const }
+        : {}),
   });
   const role = createElectronRoleNode(context, {
     kind:
@@ -261,8 +312,12 @@ const addDiscoveredRole = (
     coverage: input.coverage,
   });
   const source =
-    sourceNodeFor(context, input.file.path, input.value.module_key) ??
-    input.asset;
+    sourceNodeFor(
+      context,
+      input.file.path,
+      input.value.module_key,
+      input.value.module_runtime,
+    ) ?? input.asset;
   addStaticInferenceEdge(context, {
     source,
     target: role,
@@ -288,18 +343,27 @@ const addSourceMapEdge = (
   const declaredUrlSha256 = createHash("sha256")
     .update(input.value.declared_url)
     .digest("hex");
-  const resolvedPath = resolveArtifactPathByContext({
+  const resolution = resolveArtifactPathByContext({
     declaredPath: input.value.declared_url,
     sourcePath: input.file.path,
     context: "url-reference",
     files: context.filesByPath,
-  }).resolved_path;
+    directoryPaths: context.directoryPaths,
+    unanalyzedFiles: context.unanalyzedFiles,
+  });
+  const resolvedPath = resolution.resolved_path;
   const resolvedFile =
     resolvedPath === null ? undefined : context.filesByPath.get(resolvedPath);
   const resolvedNode =
     resolvedPath === null ? undefined : context.fileNodes.get(resolvedPath);
   const isAvailable =
     resolvedFile?.kind === "source-map" && resolvedNode !== undefined;
+  const limitations =
+    isAvailable || resolution.limitations.length > 0
+      ? resolution.limitations
+      : [
+          "The declared reference does not identify an available source-map projection.",
+        ];
   const target = context.accumulator.addNode({
     kind: "source-map",
     identity:
@@ -317,6 +381,8 @@ const addSourceMapEdge = (
           declared_url: input.value.declared_url,
           declared_url_sha256: declaredUrlSha256,
           resolved_path: resolvedPath,
+          resolution_status: resolution.resolution_status,
+          ...artifactPathResolutionProperties(resolution),
           available: isAvailable,
         },
         evidence: staticInferenceEvidence({
@@ -326,11 +392,7 @@ const addSourceMapEdge = (
           operation: "discover-source-map",
           coverage: input.coverage,
           confidence: "medium",
-          limitations: isAvailable
-            ? []
-            : [
-                "The declared source map was not present in the inventoried artifact.",
-              ],
+          limitations,
         }),
       },
     ],
@@ -342,9 +404,12 @@ const addSourceMapEdge = (
     range: input.value.location,
     coverage: input.coverage,
     relation: "maps_to",
+    limitations,
     properties: {
       declared_url_sha256: declaredUrlSha256,
       resolved_path: resolvedPath,
+      resolution_status: resolution.resolution_status,
+      ...artifactPathResolutionProperties(resolution),
     },
   });
 };
@@ -353,44 +418,95 @@ const resolveReference = (
   context: JavaScriptArtifactGraphContext,
   sourcePath: string,
   reference: StaticReference,
+  coverage: JavaScriptArtifactGraphCoverage,
 ): ResolvedReference | null => {
   const specifier = reference.specifier;
   if (specifier === null) return null;
-  const chunk = resolveBundlerChunkReference(context, sourcePath, reference);
+  const isWorker =
+    reference.kind === "worker" || reference.kind === "service-worker";
+  const chunk = isWorker
+    ? null
+    : resolveBundlerChunkReference(context, sourcePath, reference);
   if (chunk !== null) return chunk;
-  const module = context.moduleNodes.get(
-    moduleLookupKey(sourcePath, specifier),
-  );
+  const module =
+    isWorker || reference.module_runtime === undefined
+      ? undefined
+      : context.moduleNodes.get(
+          moduleLookupKey(sourcePath, reference.module_runtime, specifier),
+        );
   if (module !== undefined) {
     const file = context.filesByPath.get(sourcePath);
     return file === undefined
       ? null
-      : { path: `${sourcePath}#module:${specifier}`, file, node: module };
+      : {
+          path: `${sourcePath}#module:${specifier}`,
+          file,
+          node: module,
+          limitations: [],
+        };
   }
   // Worker scripts are URLs relative to the script, not module specifiers.
-  const path =
-    reference.kind === "worker" || reference.kind === "service-worker"
-      ? resolveArtifactPathByContext({
-          declaredPath: specifier,
-          sourcePath,
-          context: "url-reference",
-          files: context.filesByPath,
-        }).resolved_path
-      : resolveArtifactPath(
-          specifier,
-          sourcePath,
-          context.filesByPath,
-          reference.kind === "require"
-            ? "require"
-            : reference.kind === "static-import" ||
-                reference.kind === "dynamic-import"
-              ? "import"
-              : undefined,
-        );
-  if (path === null) return null;
+  const resolution = isWorker
+    ? resolveArtifactPathByContext({
+        declaredPath: specifier,
+        sourcePath,
+        context: "url-reference",
+        files: context.filesByPath,
+        directoryPaths: context.directoryPaths,
+        unanalyzedFiles: context.unanalyzedFiles,
+      })
+    : resolveArtifactPathByContext({
+        declaredPath: specifier,
+        sourcePath,
+        context: "module-specifier",
+        files: context.filesByPath,
+        directoryPaths: context.directoryPaths,
+        unanalyzedFiles: context.unanalyzedFiles,
+        ...("require" === reference.kind ||
+        "static-import" === reference.kind ||
+        "dynamic-import" === reference.kind
+          ? {
+              moduleKind: moduleResolutionModeForJavaScriptReference(
+                sourcePath,
+                reference.kind,
+              ),
+            }
+          : {}),
+      });
+  const path = resolution.resolved_path;
+  if (path === null) {
+    const source = context.filesByPath.get(sourcePath);
+    return source === undefined
+      ? null
+      : {
+          path: null,
+          file: null,
+          node: isWorker
+            ? null
+            : unresolvedReferenceNode(
+                context,
+                source,
+                reference,
+                coverage,
+                resolution,
+              ),
+          limitations: resolution.limitations,
+          resolutionStatus: resolution.resolution_status,
+          resolution,
+        };
+  }
   const file = context.filesByPath.get(path);
   const node = context.fileNodes.get(path);
-  return file === undefined || node === undefined ? null : { path, file, node };
+  return file === undefined || node === undefined
+    ? null
+    : {
+        path,
+        file,
+        node,
+        limitations: resolution.limitations,
+        resolutionStatus: resolution.resolution_status,
+        resolution,
+      };
 };
 
 const resolveBundlerChunkReference = (
@@ -406,10 +522,11 @@ const resolveBundlerChunkReference = (
   if (file === undefined) return null;
   const registrations = context.analysis.files
     .find(({ file: analyzedFile }) => analyzedFile.path === sourcePath)
-    ?.javascript?.bundler_registrations.filter(({ modules }) =>
-      reference.module_key === null
-        ? true
-        : modules.some(
+    ?.javascript?.bundler_registrations.filter(({ runtime, modules }) =>
+      reference.module_runtime === undefined
+        ? reference.module_key === null
+        : runtime === reference.module_runtime &&
+          modules.some(
             ({ module_key: moduleKey }) => moduleKey === reference.module_key,
           ),
     );
@@ -427,7 +544,7 @@ const resolveBundlerChunkReference = (
   const node = unique[0];
   return node === undefined
     ? null
-    : { path: `${sourcePath}#chunk:${key}`, file, node };
+    : { path: `${sourcePath}#chunk:${key}`, file, node, limitations: [] };
 };
 
 const unresolvedReferenceNode = (
@@ -435,6 +552,7 @@ const unresolvedReferenceNode = (
   file: JavaScriptArtifactFile,
   reference: StaticReference,
   coverage: JavaScriptArtifactGraphCoverage,
+  resolution?: ArtifactPathResolution,
 ): ApplicationNode =>
   context.accumulator.addNode({
     kind: "javascript-module",
@@ -451,6 +569,10 @@ const unresolvedReferenceNode = (
           specifier: reference.specifier,
           expression: reference.expression,
           resolution: "unresolved",
+          ...(resolution === undefined
+            ? {}
+            : { resolution_status: resolution.resolution_status }),
+          ...artifactPathResolutionProperties(resolution),
         },
         evidence: staticInferenceEvidence({
           sha256: file.sha256,
@@ -461,6 +583,7 @@ const unresolvedReferenceNode = (
           confidence: "low",
           limitations: [
             "The static reference could not be resolved within the inventoried artifact.",
+            ...(resolution?.limitations ?? []),
           ],
         }),
       },

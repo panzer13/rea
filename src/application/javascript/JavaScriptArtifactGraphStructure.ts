@@ -1,7 +1,11 @@
 import type { ArtifactInventorySnapshot } from "../../domain/artifactInventorySnapshot.js";
 import type { ApplicationNode } from "../../domain/javascript/javascriptApplicationGraphSchemas.js";
+import { htmlInlineScriptLimitation } from "./JavaScriptArtifactAnalysis.js";
 import { completeApplicationCoverage } from "../../domain/javascript/javascriptApplicationEvidenceSchemas.js";
 import type { JavaScriptModuleArtifactAnalysis } from "./JavaScriptArtifactAnalysisTypes.js";
+import { jsonValueSchema } from "../../domain/jsonValue.js";
+import { freezeJsonSnapshot } from "../../domain/immutableJson.js";
+import type { JavaScriptSourceRange } from "../../domain/javascript/javascriptStaticAnalysisTypes.js";
 import type {
   JavaScriptArtifactContainer,
   JavaScriptArtifactFile,
@@ -12,15 +16,23 @@ import {
   addUnavailableStaticParseScope,
   artifactFileNodeKind,
   artifactLocalIdentity,
+  javascriptAnalysisCoverage,
   createElectronRoleNode,
+  HTML_INLINE_SCRIPT_LOCATION_COVERAGE_LIMIT,
+  omittedHtmlInlineScriptLocations,
   linkElectronRoleToAsset,
   type JavaScriptArtifactGraphContext,
 } from "./JavaScriptArtifactGraphContext.js";
 import {
   artifactObservationEvidence,
+  astObservationEvidence,
   staticInferenceEvidence,
 } from "./JavaScriptArtifactGraphEvidence.js";
-import { resolveArtifactPathByContext } from "./JavaScriptArtifactPathResolution.js";
+import {
+  artifactPathResolutionProperties,
+  resolveArtifactPathByContext,
+} from "./JavaScriptArtifactPathResolution.js";
+import { compareUnicodeCodePoints } from "../../domain/unicodeCodePointOrder.js";
 
 interface PackageRoleInput {
   readonly packageNode: ApplicationNode;
@@ -115,9 +127,55 @@ export const addJavaScriptArtifactContainers = (
 export const addJavaScriptArtifactFiles = (
   context: JavaScriptArtifactGraphContext,
 ): void => {
+  const packagesByPath = indexFirstByPath(context.analysis.packages);
+  const jsonModulesByPath = indexFirstByPath(context.analysis.json_modules);
+  const sourceMapsByPath = indexFirstByPath(context.analysis.source_maps);
+  const inlineScriptsByPath = indexFirstByPath(
+    context.analysis.html_inline_scripts,
+  );
   for (const analyzed of context.analysis.files) {
     const { file } = analyzed;
-    const target = createFileTarget(context, file, analyzed.javascript);
+    const jsonValue = jsonModulesByPath.get(file.path);
+    const target = createFileTarget(
+      context,
+      file,
+      analyzed.javascript,
+      jsonValue,
+    );
+    if (
+      analyzed.application_projection_failure !== undefined &&
+      analyzed.javascript !== null
+    )
+      context.accumulator.addNode({
+        kind: target.kind,
+        identity: target.identity,
+        observations: [
+          {
+            label: file.path,
+            properties: {
+              static_analysis: freezeJsonSnapshot(
+                jsonValueSchema.parse(analyzed.javascript),
+              ),
+              semantic_module_analysis:
+                analyzed.semantic === null
+                  ? null
+                  : freezeJsonSnapshot(
+                      jsonValueSchema.parse(analyzed.semantic.ir),
+                    ),
+              application_projection_failure:
+                analyzed.application_projection_failure.error,
+            },
+            evidence: astObservationEvidence({
+              sha256: file.sha256,
+              path: file.path,
+              operation: "retain-unexpanded-static-findings",
+              range: sourceFileRange(file),
+              coverage: javascriptAnalysisCoverage(analyzed.javascript),
+              limitations: [analyzed.application_projection_failure.reason],
+            }),
+          },
+        ],
+      });
     context.fileNodes.set(file.path, target);
     if (file.kind === "javascript") context.assetNodes.set(file.path, target);
     const entry = createAsarEntry(context, file);
@@ -150,7 +208,26 @@ export const addJavaScriptArtifactFiles = (
         }),
       });
     }
-    if (
+    if (!file.text.included && file.text.reason === "outside-analysis-scope")
+      addUnavailableStaticParseScope(context, {
+        file,
+        asset: target,
+        operation: "select-javascript-sources",
+        limitation:
+          "Source is outside the caller-selected source_paths; it was inventoried but not analyzed.",
+      });
+    else if (analyzed.analysis_failure !== undefined)
+      addUnavailableStaticParseScope(context, {
+        file,
+        asset: target,
+        operation: "analyze-javascript-source",
+        limitation: analyzed.analysis_failure.reason,
+        failure: analyzed.analysis_failure.error,
+        limits: javaScriptAnalysisCoverageLimits(
+          analyzed.analysis_failure.limits,
+        ),
+      });
+    else if (
       file.kind === "javascript" &&
       (analyzed.javascript === null ||
         analyzed.javascript.parse_status === "failed")
@@ -163,9 +240,18 @@ export const addJavaScriptArtifactFiles = (
           ? "JavaScript syntax could not be parsed."
           : `JavaScript text was unavailable: ${file.text.reason}.`,
       });
-    const packageValue = context.analysis.packages.find(
-      ({ path }) => path === file.path,
-    );
+    if (analyzed.application_projection_failure !== undefined)
+      addUnavailableStaticParseScope(context, {
+        file,
+        asset: target,
+        operation: "project-javascript-application",
+        limitation: analyzed.application_projection_failure.reason,
+        failure: analyzed.application_projection_failure.error,
+        limits: javaScriptAnalysisCoverageLimits(
+          analyzed.application_projection_failure.limits,
+        ),
+      });
+    const packageValue = packagesByPath.get(file.path);
     if (packageValue !== undefined && packageValue.status !== "included")
       addUnavailableStaticParseScope(context, {
         file,
@@ -173,9 +259,6 @@ export const addJavaScriptArtifactFiles = (
         operation: "parse-package-json",
         limitation: packageValue.limitation,
       });
-    const jsonValue = context.analysis.json_modules.find(
-      ({ path }) => path === file.path,
-    );
     if (jsonValue !== undefined && jsonValue.status !== "included")
       addUnavailableStaticParseScope(context, {
         file,
@@ -183,9 +266,7 @@ export const addJavaScriptArtifactFiles = (
         operation: "parse-json-module",
         limitation: jsonValue.limitation,
       });
-    const sourceMap = context.analysis.source_maps.find(
-      ({ path }) => path === file.path,
-    );
+    const sourceMap = sourceMapsByPath.get(file.path);
     if (sourceMap !== undefined && sourceMap.status === "invalid")
       addUnavailableStaticParseScope(context, {
         file,
@@ -193,7 +274,49 @@ export const addJavaScriptArtifactFiles = (
         operation: "parse-local-source-map",
         limitation: sourceMap.limitation,
       });
+    const inlineScripts = inlineScriptsByPath.get(file.path);
+    if (inlineScripts !== undefined)
+      addUnavailableStaticParseScope(context, {
+        file,
+        asset: target,
+        operation: "parse-html-inline-scripts",
+        limitation: htmlInlineScriptLimitation(inlineScripts),
+        limits:
+          inlineScripts.script_count > inlineScripts.scripts.length
+            ? [HTML_INLINE_SCRIPT_LOCATION_COVERAGE_LIMIT]
+            : [],
+        omittedCount: omittedHtmlInlineScriptLocations([inlineScripts]),
+        details: {
+          inline_script_count: inlineScripts.script_count,
+          inline_scripts: inlineScripts.scripts.map(
+            ({ script_type, location }) => ({
+              script_type,
+              location: {
+                start: { ...location.start },
+                end: { ...location.end },
+              },
+            }),
+          ),
+        },
+      });
   }
+};
+
+const sourceFileRange = (
+  file: JavaScriptArtifactFile,
+): JavaScriptSourceRange => {
+  if (!file.text.included)
+    throw new TypeError("Retained static facts require their source text");
+  let line = 1;
+  let lastLineStart = 0;
+  for (const match of file.text.value.matchAll(/\r\n|[\n\r\u2028\u2029]/gu)) {
+    line += 1;
+    lastLineStart = match.index + match[0].length;
+  }
+  return {
+    start: { line: 1, column: 0 },
+    end: { line, column: file.text.value.length - lastLineStart },
+  };
 };
 
 /** Project package metadata and its declared Electron roles. */
@@ -201,6 +324,7 @@ export const addJavaScriptPackageNodes = (
   context: JavaScriptArtifactGraphContext,
 ): ApplicationNode[] => {
   const roots: ApplicationNode[] = [];
+  const rootPath = applicationManifestPath(context);
   for (const packageValue of context.analysis.packages) {
     const file = context.filesByPath.get(packageValue.path);
     if (file === undefined) continue;
@@ -229,7 +353,7 @@ export const addJavaScriptPackageNodes = (
         },
       ],
     });
-    if (roots.length === 0) {
+    if (file.path === rootPath) {
       roots.push(node);
       context.accumulator.addEdge({
         source_node_id: node.node_id,
@@ -250,6 +374,7 @@ export const addJavaScriptPackageNodes = (
         file,
         operation: "inventory-package",
       });
+    if (dependencyManifest(file.path)) continue;
     addPackageRole(context, {
       packageNode: node,
       packageFile: file,
@@ -266,15 +391,31 @@ export const addJavaScriptPackageNodes = (
   return roots;
 };
 
+/** Dependency-only artifacts retain their inventory root. */
+const applicationManifestPath = (
+  context: JavaScriptArtifactGraphContext,
+): string | undefined =>
+  context.analysis.packages
+    .map(({ path }) => path)
+    .filter(
+      (path) => context.filesByPath.has(path) && !dependencyManifest(path),
+    )
+    .sort(
+      (left, right) =>
+        left.split("/").length - right.split("/").length ||
+        compareUnicodeCodePoints(left, right),
+    )[0];
+
+const dependencyManifest = (path: string): boolean =>
+  path.split("/").slice(0, -1).includes("node_modules");
+
 const createFileTarget = (
   context: JavaScriptArtifactGraphContext,
   file: JavaScriptArtifactFile,
   javascript: JavaScriptModuleArtifactAnalysis["files"][number]["javascript"],
+  json: JavaScriptModuleArtifactAnalysis["json_modules"][number] | undefined,
 ): ApplicationNode => {
   const kind = artifactFileNodeKind(file.kind);
-  const json = context.analysis.json_modules.find(
-    ({ path }) => path === file.path,
-  );
   return context.accumulator.addNode({
     kind,
     identity: {
@@ -307,6 +448,16 @@ const createFileTarget = (
       },
     ],
   });
+};
+
+const indexFirstByPath = <Value extends { readonly path: string }>(
+  values: readonly Value[],
+): ReadonlyMap<string, Value> => {
+  const index = new Map<string, Value>();
+  for (const value of values) {
+    if (!index.has(value.path)) index.set(value.path, value);
+  }
+  return index;
 };
 
 const createAsarEntry = (
@@ -355,6 +506,8 @@ const addPackageRole = (
     sourcePath: input.packageFile.path,
     context: "package-entrypoint",
     files: context.filesByPath,
+    directoryPaths: context.directoryPaths,
+    unanalyzedFiles: context.unanalyzedFiles,
   });
   const role = createElectronRoleNode(context, {
     kind: input.kind,
@@ -374,6 +527,7 @@ const addPackageRole = (
       resolution_context: resolution.resolution_context,
       resolved_path: resolution.resolved_path,
       resolution_status: resolution.resolution_status,
+      ...artifactPathResolutionProperties(resolution),
       limitations: resolution.limitations,
     },
     evidence: staticInferenceEvidence({
@@ -397,3 +551,4 @@ const containerProperties = (container: JavaScriptArtifactContainer) => ({
   bytes: container.bytes,
   inventory_artifact_id: container.inventory_artifact_id,
 });
+import { javaScriptAnalysisCoverageLimits } from "../../domain/javascript/javascriptAnalysisResourceControls.js";

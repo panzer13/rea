@@ -1,7 +1,12 @@
 import { z } from "zod";
 
 import type { ToolContract } from "./toolContractTypes.js";
-import { presentInputJsonSchema } from "./inputSchemaPresentation.js";
+import { advertisedInputExamples } from "./advertisedInputExamples.js";
+import {
+  advertisedReferenceExpansionBudget,
+  inputSchemaWithinReferenceExpansionBudget,
+  presentInputJsonSchema,
+} from "./inputSchemaPresentation.js";
 import { digestCanonicalValue } from "../domain/canonicalDigest.js";
 
 const PROPERTY_DESCRIPTIONS: Readonly<Record<string, string>> = {
@@ -63,12 +68,39 @@ export const toolInputSchemaWithMetadata = <Contract extends ToolContract>(
         ...options,
         libraryOptions: { reused: "ref", ...options.libraryOptions },
       });
+      const examples = advertisedInputExamples(contract);
       return {
-        ...presentInputJsonSchema(shared, fallbackPropertyDescription),
-        examples: contract.examples.map(({ input }) => input),
+        // Sharing definitions only helps clients that resolve them. A client
+        // rendering declarations from a shared expansion budget degrades
+        // every reference past it to `unknown`, so an input whose shared form
+        // exceeds the budget is re-projected without shared definitions.
+        ...inputSchemaWithinReferenceExpansionBudget(
+          presentInputJsonSchema(shared, fallbackPropertyDescription),
+          () =>
+            presentInputJsonSchema(
+              project({
+                ...options,
+                libraryOptions: {
+                  ...options.libraryOptions,
+                  reused: "inline",
+                },
+              }),
+              fallbackPropertyDescription,
+            ),
+          advertisedReferenceExpansionBudget,
+        ),
+        ...(examples.length === 0 ? {} : { examples }),
       };
     },
   );
+
+/** Return the same complete input JSON Schema projection registered on MCP. */
+export const advertisedInputJsonSchema = <Contract extends ToolContract>(
+  contract: Contract,
+): Record<string, unknown> =>
+  toolInputSchemaWithMetadata(contract)["~standard"].jsonSchema.input({
+    target: "draft-2020-12",
+  }) as Record<string, unknown>;
 
 /** Share output definitions and content-bound validator identities on the wire. */
 export const toolOutputSchemaWithMetadata = <Contract extends ToolContract>(
@@ -94,6 +126,46 @@ export const toolOutputSchemaWithMetadata = <Contract extends ToolContract>(
       };
     },
   );
+
+/**
+ * Apply a wire-presentation transform to one schema's advertised input
+ * projection. The wrapper preserves the schema's own parser and standard
+ * metadata, so both Zod registrations and plain standard schemas keep their
+ * canonical validation while only the advertised JSON changes.
+ */
+export const transformAdvertisedInputJsonSchema = <Schema>(
+  schema: Schema,
+  transform: (projected: Record<string, unknown>) => Record<string, unknown>,
+): Schema => {
+  const standard = Reflect.get(schema as object, "~standard");
+  if (!isSchemaRecord(standard)) return schema;
+  const jsonSchema = Reflect.get(standard, "jsonSchema");
+  if (!isSchemaRecord(jsonSchema)) return schema;
+  const project = Reflect.get(jsonSchema, "input");
+  if (typeof project !== "function") return schema;
+  const byTarget = new Map<string, Record<string, unknown>>();
+  const transformedInput = (options: unknown): unknown => {
+    const target = Reflect.get(options as object, "target");
+    if (typeof target === "string") {
+      const cached = byTarget.get(target);
+      if (cached !== undefined) return cached;
+    }
+    const projected = (project as (options: unknown) => unknown)(options);
+    const transformed = isSchemaRecord(projected)
+      ? transform(projected)
+      : projected;
+    if (typeof target === "string" && isSchemaRecord(transformed))
+      byTarget.set(target, transformed);
+    return transformed;
+  };
+  return {
+    ...(schema as object),
+    "~standard": {
+      ...standard,
+      jsonSchema: { ...jsonSchema, input: transformedInput },
+    },
+  } as Schema;
+};
 
 const hasRelativeSchemaReference = (
   schema: Record<string, unknown>,
@@ -164,7 +236,10 @@ const memoizeByTarget = (
   };
 };
 
-const fallbackPropertyDescription = (property: string): string => {
+const isSchemaRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const fallbackPropertyDescription = (property: string): string | undefined => {
   const explicit = Object.hasOwn(PROPERTY_DESCRIPTIONS, property)
     ? PROPERTY_DESCRIPTIONS[property]
     : undefined;
@@ -192,5 +267,6 @@ const fallbackPropertyDescription = (property: string): string => {
     return `Local filesystem ${words} selected for this operation.`;
   if (property.startsWith("is_") || property.startsWith("has_"))
     return `Whether ${words}.`;
-  return `Value for ${words}.`;
+  // A generic sentence would only restate the property name in every schema.
+  return undefined;
 };

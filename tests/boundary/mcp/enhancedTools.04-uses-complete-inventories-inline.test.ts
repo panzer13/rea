@@ -82,58 +82,62 @@ it("discovers declarations without counting duplicates or compiler bookkeeping",
   });
 });
 
+const completeOverviewPort: AnalysisOperationPort = {
+  execute: (name) => {
+    switch (name) {
+      case "list_segments":
+        return Promise.resolve(
+          ok([
+            {
+              name: "__TEXT",
+              start: "0x1000",
+              end: "0x1800",
+              image_base: "0x1000",
+              readable: null,
+              writable: null,
+              executable: null,
+            },
+            {
+              name: "__DATA",
+              start: "0x1800",
+              end: "0x2000",
+              image_base: "0x1000",
+              readable: null,
+              writable: null,
+              executable: null,
+            },
+          ]),
+        );
+      case "current_document":
+        return Promise.resolve(ok("fixture"));
+      case "list_documents":
+        return Promise.resolve(ok(["New Document", "fixture"]));
+      case "list_strings":
+        return Promise.resolve(
+          ok(
+            Array.from({ length: 700 }, (_, index) => ({
+              address: `0x${(0x30 + index).toString(16)}`,
+              value: `string-${index}`,
+            })),
+          ),
+        );
+      case "list_procedures": {
+        return Promise.resolve(
+          ok([
+            { address: "0x1", value: "first" },
+            { address: "0x2", value: "last" },
+          ]),
+        );
+      }
+      default:
+        throw new Error(`Unexpected analysis operation: ${name}`);
+    }
+  },
+};
+
 describe("enhanced MCP tools", () => {
   it("returns the complete overview inline with exhaustive totals", async () => {
-    const client = await connect({
-      execute: (name) => {
-        switch (name) {
-          case "list_segments":
-            return Promise.resolve(
-              ok([
-                {
-                  name: "__TEXT",
-                  start: "0x1000",
-                  end: "0x1800",
-                  readable: null,
-                  writable: null,
-                  executable: null,
-                },
-                {
-                  name: "__DATA",
-                  start: "0x1800",
-                  end: "0x2000",
-                  readable: null,
-                  writable: null,
-                  executable: null,
-                },
-              ]),
-            );
-          case "current_document":
-            return Promise.resolve(ok("fixture"));
-          case "list_documents":
-            return Promise.resolve(ok(["New Document", "fixture"]));
-          case "list_strings":
-            return Promise.resolve(
-              ok(
-                Array.from({ length: 700 }, (_, index) => ({
-                  address: `0x${(0x30 + index).toString(16)}`,
-                  value: `string-${index}`,
-                })),
-              ),
-            );
-          case "list_procedures": {
-            return Promise.resolve(
-              ok([
-                { address: "0x1", value: "first" },
-                { address: "0x2", value: "last" },
-              ]),
-            );
-          }
-          default:
-            return Promise.resolve(ok(null));
-        }
-      },
-    });
+    const client = await connect(completeOverviewPort);
     const result = jsonResult(
       await client.callTool({
         name: "binary_overview",
@@ -142,13 +146,68 @@ describe("enhanced MCP tools", () => {
     );
     expect(result).toEqual({
       document: "fixture",
+      image_base: "0x1000",
       segments: [
-        { name: "__TEXT", start: "0x1000", end: "0x1800", length: 2048 },
-        { name: "__DATA", start: "0x1800", end: "0x2000", length: 2048 },
+        {
+          name: "__TEXT",
+          start: "0x1000",
+          end: "0x1800",
+          length: 2048,
+          image_base: "0x1000",
+        },
+        {
+          name: "__DATA",
+          start: "0x1800",
+          end: "0x2000",
+          length: 2048,
+          image_base: "0x1000",
+        },
       ],
       segment_count: 2,
       procedure_count: 2,
       string_count: 700,
+    });
+  });
+
+  it("returns binary counts while omitting unavailable segment coverage", async () => {
+    const client = await connect({
+      execute: (name) => {
+        if (name === "current_document")
+          return Promise.resolve(
+            err(
+              new AnalysisCapabilityUnavailableError(
+                "fixture",
+                name,
+                "the provider has one bound document",
+              ),
+            ),
+          );
+        if (name === "list_documents")
+          return Promise.resolve(ok(["/tmp/fixture.bin"]));
+        if (name === "list_segments")
+          return Promise.resolve(
+            err(
+              new AnalysisCapabilityUnavailableError(
+                "fixture",
+                name,
+                "segment enumeration is unsupported",
+              ),
+            ),
+          );
+        if (name === "list_procedures" || name === "list_strings")
+          return Promise.resolve(ok([]));
+        throw new Error(`Unexpected analysis operation: ${name}`);
+      },
+    });
+
+    expect(
+      jsonResult(
+        await client.callTool({ name: "binary_overview", arguments: {} }),
+      ),
+    ).toEqual({
+      document: "/tmp/fixture.bin",
+      procedure_count: 0,
+      string_count: 0,
     });
   });
 
@@ -174,26 +233,29 @@ describe("enhanced MCP tools", () => {
 
   it("rejects a segment with omitted coordinates instead of reporting zero length", async () => {
     const client = await connect({
-      execute: (name) =>
-        Promise.resolve(
-          name === "list_segments"
-            ? ok([
-                {
-                  name: "__TEXT",
-                  end: "0x2000",
-                  readable: null,
-                  writable: null,
-                  executable: null,
-                },
-              ])
-            : ok(name === "current_document" ? "fixture" : []),
-        ),
+      execute: (name) => {
+        if (name === "list_segments")
+          return Promise.resolve(
+            ok([
+              {
+                name: "__TEXT",
+                end: "0x2000",
+                readable: null,
+                writable: null,
+                executable: null,
+              },
+            ]),
+          );
+        if (name === "current_document") return Promise.resolve(ok("fixture"));
+        if (name === "list_procedures" || name === "list_strings")
+          return Promise.resolve(ok([]));
+        throw new Error(`Unexpected analysis operation: ${name}`);
+      },
     });
     const result = await client.callTool({
       name: "binary_overview",
       arguments: {},
     });
-
     expect(result.isError).toBe(true);
     expect(result.content).toContainEqual({
       type: "text",
@@ -225,8 +287,11 @@ const overviewPort = (
             },
           ]),
         );
-      default:
+      case "list_procedures":
+      case "list_strings":
         return Promise.resolve(ok([]));
+      default:
+        throw new Error(`Unexpected analysis operation: ${name}`);
     }
   },
 });
@@ -291,5 +356,39 @@ describe("overview document identity through MCP", () => {
       (await client.callTool({ name: "binary_overview", arguments: {} }))
         .isError,
     ).toBe(true);
+  });
+
+  it("reports document selection unavailable when neither current-document nor list-documents is supported", async () => {
+    const client = await connect({
+      execute: (name) => {
+        if (name === "current_document" || name === "list_documents")
+          return Promise.resolve(
+            err(
+              new AnalysisCapabilityUnavailableError(
+                "fixture",
+                name,
+                "provider lacks document selection",
+              ),
+            ),
+          );
+        if (name === "list_segments") return Promise.resolve(ok([]));
+        if (name === "list_procedures" || name === "list_strings")
+          return Promise.resolve(ok([]));
+        throw new Error(`Unexpected analysis operation: ${name}`);
+      },
+    });
+    const result = await client.callTool({
+      name: "binary_overview",
+      arguments: {},
+    });
+    expect(result.isError).toBe(true);
+    expect(parseMcpToolError(result).error).toMatchObject({
+      code: "capability_unavailable",
+      details: {
+        provider_id: "fixture",
+        operation: "list_documents",
+        reason: expect.stringContaining("provider lacks document selection"),
+      },
+    });
   });
 });

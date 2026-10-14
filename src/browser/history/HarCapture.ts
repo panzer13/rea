@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { isSafeNumber, LosslessNumber } from "lossless-json";
-import { parseHarJson } from "./HarJson.js";
+import { LosslessNumber } from "lossless-json";
+import { parseCaptureJson } from "./CaptureJson.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
 import {
   WEB_NETWORK_CAPTURE_LIMITS,
@@ -30,7 +30,7 @@ export const decodeHarCapture = (
   text: string,
   sensitiveValues: readonly string[],
 ): DecodedCapture => {
-  const raw = parseHarJson(text);
+  const raw = parseCaptureJson(text, "HAR");
   const validation = projectHar(raw, [], false);
   createHarValidator()(validation.reported);
   if (
@@ -121,13 +121,14 @@ const projectHar = (
     )
       return redactor.credential(pointer);
     if (item instanceof LosslessNumber) {
-      if (redact && redactor.text(item.value, pointer) === null) return null;
+      const number = redactor.number(item, pointer, redact);
+      if (number === null) return null;
       numeric_literals.push({
         pointer,
         producer_type: "json-number",
-        literal: item.value,
+        literal: number.literal,
       });
-      return isSafeNumber(item.value) ? Number(item.value) : null;
+      return number.reported;
     }
     if (typeof item === "string") {
       if (
@@ -144,7 +145,8 @@ const projectHar = (
             (literal) =>
               item.includes(literal) ||
               contentBase64.includes(literal) ||
-              sha256.includes(literal),
+              sha256.includes(literal) ||
+              String(bytes.length).includes(literal),
           );
         binary_fields.push(
           hidden

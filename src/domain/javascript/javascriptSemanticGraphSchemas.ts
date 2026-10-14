@@ -184,7 +184,6 @@ const relativePathSchema = z
   .refine(
     (path) =>
       !path.startsWith("/") &&
-      !path.includes("\\") &&
       path.split("/").every((part) => !["", ".", ".."].includes(part)),
     "Expected a normalized relative POSIX path without traversal",
   );
@@ -233,11 +232,9 @@ export const javaScriptSemanticNodeInputSchema = z.strictObject({
 export const javaScriptSemanticNodeSchema =
   javaScriptSemanticNodeInputSchema.extend({
     evidence: javaScriptSemanticEvidenceReferenceSchema,
-    node_id: semanticNodeIdSchema,
-    identifier_strategy: z.strictObject({
-      strategy: z.literal("semantic-content-sha256"),
-      stability: z.literal("artifact-version"),
-    }),
+    node_id: semanticNodeIdSchema.describe(
+      "SHA-256 of the node kind and identity; stable for one artifact version.",
+    ),
   });
 
 /** One directed semantic relationship before its ID is derived. */
@@ -254,11 +251,9 @@ export const javaScriptSemanticRelationInputSchema = z.strictObject({
 export const javaScriptSemanticRelationSchema =
   javaScriptSemanticRelationInputSchema.extend({
     evidence: javaScriptSemanticEvidenceReferenceSchema,
-    relation_id: semanticRelationIdSchema,
-    identifier_strategy: z.strictObject({
-      strategy: z.literal("semantic-content-sha256"),
-      stability: z.literal("relationship-exact"),
-    }),
+    relation_id: semanticRelationIdSchema.describe(
+      "SHA-256 of the exact relation content, including its evidence reference.",
+    ),
   });
 
 /** Reasons semantic analysis can leave an explicit frontier. */

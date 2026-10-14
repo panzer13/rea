@@ -1,4 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { Client } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -8,12 +10,35 @@ import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import {
   compareInventory,
   runProductionMcpDoctor,
+  runProductionMcpDoctorCli,
 } from "../../../src/mcpDoctor.js";
 import { CATALOG_IDENTITY } from "../../../src/catalogIdentity.js";
 
 afterEach(() => vi.useRealTimers());
 
 describe("production MCP doctor", () => {
+  it("preserves the full-output envelope for startup failures", async () => {
+    const result = await runProductionMcpDoctorCli(
+      ["--json", "--full-output"],
+      {
+        dispatcherPath: resolve("tests/fixtures/mcpDoctorExit.mjs"),
+        packageRoot: process.cwd(),
+      },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.output)).toMatchObject({
+      ok: false,
+      error: {
+        healthy: false,
+        checks: [{ name: "transport", ok: false }],
+      },
+      meta: {
+        command: "rea mcp doctor",
+        duration: expect.stringMatching(/^\d+ms$/u),
+      },
+    });
+  });
+
   it("connects to the production stdio child and verifies the canonical catalog", async () => {
     const result = await runProductionMcpDoctor({
       command: process.execPath,
@@ -42,6 +67,81 @@ describe("production MCP doctor", () => {
       CATALOG_IDENTITY.counts.mcp_tools,
     );
   }, 30_000);
+});
+
+describe("production MCP doctor probe validation", () => {
+  it("rejects a schema-invalid probe while retaining the discovered inventory", async () => {
+    const root = await createTestTempDirectory("rea-mcp-doctor-reply-");
+    const snapshotPath = join(root, "reply.json");
+    const environment = { PATH: process.env.PATH ?? "" };
+    const client = new Client({ name: "doctor-reply-capture", version: "1" });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [resolve("scripts/rea.mjs"), "mcp"],
+      cwd: process.cwd(),
+      env: environment,
+      stderr: "pipe",
+    });
+    transport.stderr?.on("data", () => undefined);
+    try {
+      await client.connect(transport);
+      const tools = await client.listTools();
+      const prompts = await client.listPrompts();
+      const toolDefinition = tools.tools.find(
+        ({ name }) => name === "binary_session",
+      );
+      if (toolDefinition === undefined)
+        throw new Error("Production binary_session contract is missing");
+      const reply = await client.callTool(
+        { name: "binary_session", arguments: {} },
+        { toolDefinition },
+      );
+      await writeFile(
+        snapshotPath,
+        JSON.stringify({
+          serverInfo: client.getServerVersion(),
+          protocolVersion: client.getNegotiatedProtocolVersion(),
+          tools,
+          prompts,
+          reply,
+        }),
+      );
+    } finally {
+      await client.close();
+      await transport.close();
+    }
+    // Replay real production metadata through a synthetic stdio producer.
+    for (const mode of ["valid", "invalid"]) {
+      const result = await runProductionMcpDoctor({
+        command: process.execPath,
+        args: [
+          resolve("tests/fixtures/mcpDoctorReply.mjs"),
+          snapshotPath,
+          mode,
+        ],
+        cwd: process.cwd(),
+        environment,
+      });
+      expect(result.healthy).toBe(mode === "valid");
+      expect(result.inventory?.tools.observed).toBe(
+        CATALOG_IDENTITY.counts.mcp_tools,
+      );
+      expect(result.inventory?.prompts.observed).toBe(
+        CATALOG_IDENTITY.counts.mcp_prompts,
+      );
+      expect(result.checks).toContainEqual({
+        name: "initialize",
+        ok: true,
+        detail: expect.any(String),
+      });
+      if (mode === "invalid")
+        expect(result.checks).toContainEqual({
+          name: "request-flow",
+          ok: false,
+          detail: expect.stringMatching(/output schema/iu),
+        });
+    }
+  }, 30_000);
 
   it("reports exact missing, unexpected, and duplicate inventory names", () => {
     expect(compareInventory(["a", "b"], ["b", "c", "c"])).toEqual({
@@ -52,7 +152,9 @@ describe("production MCP doctor", () => {
       duplicates: ["c"],
     });
   });
+});
 
+describe("production MCP doctor child lifecycle", () => {
   it("captures startup exit diagnostics", async () => {
     const result = await runProductionMcpDoctor({
       command: process.execPath,

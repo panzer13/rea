@@ -1,3 +1,4 @@
+import { analysisTextPage } from "./analysisViewText.js";
 import type { AnalysisError } from "../analysisErrorBase.js";
 import { uniqueSorted } from "../canonicalOrdering.js";
 import type { FunctionDossier } from "../hopperValues.js";
@@ -5,7 +6,6 @@ import { jsonValueSchema } from "../jsonValue.js";
 import { err, ok, type Result } from "../result.js";
 import {
   analysisViewInputError,
-  type AnalysisViewCoverage,
   type AnalysisViewParent,
   type AnalysisViewRequest,
   type UnsignedAnalysisView,
@@ -59,62 +59,28 @@ const parentFields = (
   };
 };
 
-const pseudocodePage = (
-  body: string,
-  offset: number,
-  limit: number,
-): Result<
-  {
-    readonly item: { readonly text: string; readonly unit: "utf16-code-units" };
-    readonly coverage: AnalysisViewCoverage;
-  },
-  AnalysisError
-> => {
-  const start = Math.min(offset, body.length);
-  const high = (n: number) => n >= 0xd800 && n <= 0xdbff;
-  const low = (n: number) => n >= 0xdc00 && n <= 0xdfff;
-  if (
-    start > 0 &&
-    start < body.length &&
-    high(body.charCodeAt(start - 1)) &&
-    low(body.charCodeAt(start))
-  )
-    return err(viewError("Pseudocode offset splits a UTF-16 surrogate pair."));
-  let end = Math.min(start + limit, body.length);
-  if (
-    end > start &&
-    end < body.length &&
-    high(body.charCodeAt(end - 1)) &&
-    low(body.charCodeAt(end))
-  )
-    end--;
-  if (end === start && start < body.length)
-    return err(
-      viewError(
-        "Increase pseudocode limit to include the next complete Unicode character.",
-      ),
-    );
-  return ok({
-    item: { text: body.slice(start, end), unit: "utf16-code-units" },
-    coverage: pageViewCoverage(start, end - start, body.length),
-  });
-};
-
 const nativeRows = (
   dossier: FunctionDossier,
   facet: Exclude<
     Extract<AnalysisViewRequest, { readonly kind: "native" }>["facet"],
-    "procedure" | "pseudocode" | "value_flow_summary"
+    "procedure" | "pseudocode" | "native_api" | "value_flow_summary"
   >,
-) => {
+): readonly unknown[] | undefined => {
   const sourceFlow = dossier.native_value_flow;
   const flow = sourceFlow?.available ? sourceFlow : undefined;
   return {
     assembly: dossier.assembly,
+    basic_blocks: dossier.basic_blocks,
+    comments: dossier.comments,
     callers: dossier.callers,
     callees: dossier.callees,
     incoming_references: dossier.incoming_references,
     outgoing_references: dossier.outgoing_references,
+    unresolved_calls: dossier.unresolved_calls,
+    referenced_strings: dossier.referenced_strings,
+    referenced_names: dossier.referenced_names,
+    swift_string_literals: dossier.swift_string_literals,
+    swift_string_literal_omissions: dossier.swift_string_literal_omissions,
     value_flow_operations: flow?.operations,
     value_flow_def_use: flow?.def_use,
     value_flow_effects: flow?.effects,
@@ -144,6 +110,22 @@ export const projectNativeFunctionView = (
       ]),
     );
   const common = parentFields(parent, dossier, artifact);
+  const availabilityKeys: Readonly<Record<string, string>> = {
+    incoming_references: "references",
+    outgoing_references: "references",
+    referenced_strings: "strings_names",
+    referenced_names: "strings_names",
+    basic_blocks: "cfg",
+  };
+  const availabilityKey = availabilityKeys[view.facet] ?? view.facet;
+  const availability =
+    dossier.facet_availability?.[
+      availabilityKey as keyof NonNullable<
+        FunctionDossier["facet_availability"]
+      >
+    ];
+  if (availability?.available === false)
+    common.unknowns = uniqueSorted([...common.unknowns, availability.reason]);
   const singleton = (item: unknown): UnsignedAnalysisView => ({
     kind: "native",
     view,
@@ -151,11 +133,22 @@ export const projectNativeFunctionView = (
     coverage: completeWithinViewCoverage(1, 1),
     ...common,
   });
+  if (availability?.available === false) return ok(singleton(availability));
   const flow = dossier.native_value_flow;
-  if (view.facet === "procedure" || view.facet === "value_flow_summary") {
+  if (
+    view.facet === "procedure" ||
+    view.facet === "native_api" ||
+    view.facet === "value_flow_summary"
+  ) {
     if (view.offset !== 0)
       return err(viewError("Singleton native facets require offset 0."));
     if (view.facet === "procedure") return ok(singleton(dossier.procedure));
+    if (view.facet === "native_api")
+      return ok(
+        singleton(
+          dossier.native_api ?? { available: false, reason: "not recorded" },
+        ),
+      );
     const status =
       flow === null
         ? { available: false, reason: "not recorded" }
@@ -178,7 +171,7 @@ export const projectNativeFunctionView = (
     return ok(singleton(status));
   }
   if (view.facet === "pseudocode") {
-    const page = pseudocodePage(dossier.pseudocode, view.offset, view.limit);
+    const page = analysisTextPage(dossier.pseudocode, view.offset, view.limit);
     return page.ok
       ? ok({ kind: "native", view, ...page.value, ...common })
       : page;
@@ -188,7 +181,13 @@ export const projectNativeFunctionView = (
     return ok(
       singleton({
         available: false,
-        reason: flow?.available === false ? flow.reason : "not recorded",
+        // Only value-flow facets inherit the value-flow failure reason; an
+        // older dossier simply has no unresolved_calls record, and a target
+        // whose provider does not decode Swift literals has no such record.
+        reason:
+          view.facet.startsWith("value_flow_") && flow?.available === false
+            ? flow.reason
+            : "not recorded",
       }),
     );
   const items = rows.slice(view.offset, view.offset + view.limit);

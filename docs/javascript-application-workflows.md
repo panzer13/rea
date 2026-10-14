@@ -23,6 +23,14 @@ artifact digest and structural graph ID. Semantic tracing requires the semantic
 relation graph and reports when it is unavailable rather than treating missing
 data as an empty graph.
 
+Explicit TypeScript `import type` and `export type` declarations remain source
+facts and do not create runtime import or export relationships. Type export names
+are reported separately from value export names. Inline `type` specifiers can
+leave an empty import or re-export with side effects under
+[`verbatimModuleSyntax`](https://www.typescriptlang.org/tsconfig/verbatimModuleSyntax.html);
+REA retains those dependency candidates and reports the unavailable compiler
+options rather than assuming the dependency is erased.
+
 The semantic graph wire format stores shared non-location provenance once in
 its required `evidence_contexts` table. Each node, relation, fingerprint, and
 unknown retains its exact `evidence.location` and names the owning context with
@@ -156,9 +164,12 @@ to the comparison Evidence in a live session.
 `compare_source_to_bundle` compares one cryptographically committed
 `HistoricalSourceGraph` with authenticated application-graph Evidence. The
 stable scoring model reports every admitted signal and weight: exact source
-digest, source-map original path, exact current path, path suffix, basename, and
-language extension. Exact digest wins over location inference; weak basename
-or extension evidence never forces a mapping.
+digest, source-map original path, exact current path, path suffix, Unicode-
+equivalent path, basename, and language extension. Exact digest wins over
+location inference; weak basename, extension, and Unicode-equivalence evidence
+never forces a mapping. Unicode-equivalent spellings are candidate evidence
+only because distinct filesystem paths can preserve those spellings as separate
+files; multiple canonical-equivalent candidates remain unknown.
 
 Each historical source file is classified as `unchanged`, `modified`,
 `removed`, `split`, `merged`, `duplicated`, or `unknown`. Multiple equally
@@ -183,8 +194,13 @@ Direct return expressions, including expression-bodied arrows, are evaluated
 through an execution-free value lattice. Literal object fields and direct
 return sites are represented in the result. Calls, dynamic spreads, computed
 keys, and parser recovery remain partial or unknown.
-Objects and arrays passed to calls, constructors, or tagged templates, or used
-as method receivers, are not assumed unchanged after the invocation. Aliases
+Objects and arrays passed to calls, constructors, or tagged templates, used
+as method receivers, or stored through property targets are not assumed
+unchanged afterward. Property stores conservatively retain reference escape
+uncertainty rather than pretending to execute later writes. References
+handed back by local functions, methods, constructors, async functions, and
+generators also retain escape uncertainty, including when the call is read-only;
+this does not establish that a mutation occurred. Aliases
 and shared children in spread and rest copies retain that uncertainty; copied
 primitive slots and unrelated containing properties remain known. Object rest
 excludes consumed keys, array rest excludes the consumed prefix for known
@@ -192,6 +208,25 @@ arrays, and later explicit data properties and methods replace earlier object
 spread references. A known array prefix does not expose values from a following
 spread. Accessors, custom or uncertain iteration, unknown computed keys, and
 unknown spread lengths retain conservative uncertainty.
+Getter-local aliases of `this`, including direct destructuring and assignments,
+retain their receiver when a returned shared reference is written. These writes
+invalidate the earlier literal instead of claiming the getter executed or the
+new value is known. Straight-line alias reads retain their capture order;
+uncertain control flow remains conservative. A binding outside the getter or
+`this` in a nested ordinary function is not attributed to the getter's receiver.
+Private reads keep receiver projections separate from the private value's path.
+Receiver projections follow known data fields initialized from `this` or earlier
+self-referencing fields; static fields retain their declaring class identity.
+An alias cycle that repeatedly selects deeper children retains escape uncertainty
+at its recovered roots rather than claiming a fixed number of loop iterations.
+
+Writes through an object getter's returned receiver retain that uncertainty
+when the object is an array element, nested inside mixed object/array
+containers, or assigned to a previously declared identifier. Saving the getter
+result in an alias does not make its old field values immutable. Known array
+indices include holes; an element after a spread has only a minimum possible
+index. Unrelated properties and known array prefixes remain precise, and a
+getter read without a write does not invalidate the receiver's fields.
 Nested callable returns are not assigned to their parent callable. Projected
 graph observations carry source ranges but never source text.
 
@@ -228,7 +263,7 @@ or process workflows.
 
 ## CLI and verification
 
-All five CLI commands accept inline JSON or a path to a JSON file. The CLI
+All six CLI commands accept inline JSON or a path to a JSON file. The CLI
 returns an Evidence record directly. Put the full records in a later CLI input;
 a separate CLI process has no retained MCP connection state.
 
