@@ -23,8 +23,13 @@ import {
   skillDestinations,
 } from "./SetupSkill.js";
 import { isOwnedClientRegistrationCommand } from "./ClientRegistrationIdentity.js";
+import { CURRENT_ENTRYPOINT_PATH } from "../process/CurrentEntrypointPath.js";
 import { dshDocument } from "./DshCordisPatch.js";
 import { resolveClientConfigTransactionPath } from "./ClientConfigPath.js";
+import {
+  preserveCurrentRecoveryBackup,
+  type RecoveryBackupPreservationOptions,
+} from "./SetupRecoveryBackup.js";
 import {
   InvalidUtf8FileError,
   RegularFileCleanupFailure,
@@ -263,7 +268,9 @@ export const systemUninstallHost = (
         : item(client.name, "failed", blocker);
     },
     removeClient: (client) =>
-      removeClient(client, fileSystem, () => clientWriteBlocker(client)),
+      removeClient(client, fileSystem, resources, () =>
+        clientWriteBlocker(client),
+      ),
     inspectSkill: async () => {
       for (const destination of skillDestinations(
         home,
@@ -365,9 +372,12 @@ const readClientConfiguration = async (
     original = await fileSystem.readText(transactionPath);
   } catch (cause: unknown) {
     const readFailure =
-      cause instanceof RegularFileCleanupFailure ? cause.cause : cause;
+      cause instanceof RegularFileCleanupFailure &&
+      cause.outcome.kind === "failed"
+        ? cause.outcome.cause
+        : cause;
     return itemRead(
-      isMissing(cause)
+      isMissing(readFailure)
         ? item(client.name, "skipped", "Configuration does not exist.")
         : item(
             client.name,
@@ -431,9 +441,42 @@ const clientRegistrationRemoval = (
   };
 };
 
+/** Preserve the bytes uninstall is about to edit and return the backup holding them. */
+const backupClientConfiguration = async (
+  client: SetupClient,
+  transactionPath: string,
+  original: string,
+  options: RecoveryBackupPreservationOptions,
+): Promise<string | UninstallItem> => {
+  const failed = (detail: string) =>
+    item(
+      client.name,
+      "failed",
+      `Configuration could not be backed up, so no change was made. ${detail}`,
+    );
+  try {
+    const preserved = await preserveCurrentRecoveryBackup(
+      `${client.configPath}.rea.backup`,
+      transactionPath,
+      original,
+      options,
+    );
+    if (preserved.ok) return preserved.value;
+    if (preserved.error.kind === "occupied")
+      return failed(
+        `${preserved.error.detail}. Move that file aside, then rerun uninstall.`,
+      );
+  } catch (cause: unknown) {
+    // The resource scope retains a backup handle whose close failed.
+    if (!(cause instanceof RegularFileCleanupFailure)) throw cause;
+  }
+  return failed("Check file permissions, then rerun uninstall.");
+};
+
 const removeClient = async (
   client: SetupClient,
   fileSystem: UninstallFileSystem,
+  resources: ArtifactResourceScope,
   writeBlocker?: () => string | undefined,
 ): Promise<UninstallItem> => {
   const read = await readClientConfiguration(client, fileSystem);
@@ -475,17 +518,16 @@ const removeClient = async (
     ...(removeNative ? [clientServerPath(parsed, name)] : []),
     ...(legacyPath === undefined ? [] : [legacyPath]),
   ];
-  const backupPath = `${client.configPath}.rea.backup`;
-  try {
-    await fileSystem.copy(transactionPath, backupPath);
-  } catch (cause: unknown) {
-    if (!(cause instanceof Error && "code" in cause && cause.code === "EEXIST"))
-      return item(
-        client.name,
-        "failed",
-        "Configuration could not be backed up, so no change was made. Check file permissions, then rerun uninstall.",
-      );
-  }
+  const backupPath = await backupClientConfiguration(
+    client,
+    transactionPath,
+    original,
+    {
+      copy: (source, destination) => fileSystem.copy(source, destination),
+      resources,
+    },
+  );
+  if (typeof backupPath !== "string") return backupPath;
   try {
     await fileSystem.writeText(
       transactionPath,
@@ -522,13 +564,13 @@ const removeClient = async (
       return item(
         client.name,
         "failed",
-        "Configuration could not be updated or restored. Restore its `.rea.backup` manually, then rerun uninstall.",
+        `Configuration could not be updated or restored. Restore the backup at ${backupPath} manually, then rerun uninstall.`,
       );
     }
     return item(
       client.name,
       "failed",
-      "Configuration could not be updated. The original was restored and its `.rea.backup` was retained. Repair the configuration or restore the backup, then rerun uninstall.",
+      `Configuration could not be updated. The original was restored and its backup at ${backupPath} was retained. Repair the configuration or restore that backup, then rerun uninstall.`,
     );
   }
 };
@@ -562,12 +604,15 @@ const isOwnedRegistration = (value: unknown, client: SetupClient): boolean => {
       .safeParse(value);
     if (!parsed.success) return false;
     const command = parsed.data.command;
-    return isOwnedClientRegistrationCommand(command);
+    return isOwnedClientRegistrationCommand(command, CURRENT_ENTRYPOINT_PATH);
   }
   const parsed = registrationSchema.safeParse(value);
   if (!parsed.success) return false;
   const { command, args } = parsed.data;
-  return isOwnedClientRegistrationCommand([command, ...args]);
+  return isOwnedClientRegistrationCommand(
+    [command, ...args],
+    CURRENT_ENTRYPOINT_PATH,
+  );
 };
 
 const purgeManagedData = async (
@@ -768,6 +813,12 @@ const removeManagedSkill = async (
   const failed = results.find(({ status }) => status === "failed");
   if (failed !== undefined)
     return item(name, "failed", results.map(({ detail }) => detail).join(" "));
+  if (results.some(({ status }) => status === "retained"))
+    return item(
+      name,
+      "retained",
+      [...new Set(results.map(({ detail }) => detail))].join(" "),
+    );
   const removed = results.some(({ status }) => status === "removed");
   return item(
     name,
