@@ -1,8 +1,10 @@
 import { z } from "zod";
 import { bundleResourceRootSchema } from "../apple/bundleResourceRoot.js";
+import { jsonRecordSchema } from "../jsonRecord.js";
 import { jsonValueSchema } from "../jsonValue.js";
 
 const hexAddress = z.string().regex(/^0x[a-fA-F0-9]+$/u);
+const bytesHex = z.string().regex(/^(?:[0-9a-f]{2})*$/u);
 const coverage = <Schema extends z.ZodType>(item: Schema) =>
   z.object({
     items: z.array(item),
@@ -45,34 +47,86 @@ const permissionSchema = z.object({
   raw: z.string().nullable(),
 });
 const sectionSchema = z.object({
-  segment: z.string(),
-  name: z.string(),
+  segment: z.string().nullable(),
+  segment_bytes_hex: bytesHex
+    .optional()
+    .describe(
+      "Original segment-name bytes before the first NUL; omitted in older Evidence.",
+    ),
+  name: z.string().nullable(),
+  name_bytes_hex: bytesHex
+    .optional()
+    .describe(
+      "Original section-name bytes before the first NUL; omitted in older Evidence.",
+    ),
   address: hexAddress.nullable(),
   size: z.int().min(0).nullable(),
+  size_hex: hexAddress
+    .optional()
+    .describe(
+      "Exact section size when it cannot be represented as a safe JSON integer.",
+    ),
   file_offset: z
     .int()
     .min(0)
     .nullable()
     .describe("Offset from the start of the selected Mach-O slice."),
   alignment: z.int().min(0).nullable(),
+  alignment_exponent: z
+    .int()
+    .min(0)
+    .optional()
+    .describe(
+      "Exact binary alignment exponent when the corresponding byte alignment is not a safe JSON integer.",
+    ),
   flags: z.array(z.string()),
 });
 const segmentSchema = z.object({
-  name: z.string(),
+  name: z.string().nullable(),
+  name_bytes_hex: bytesHex
+    .optional()
+    .describe(
+      "Original segment-name bytes before the first NUL; omitted in older Evidence.",
+    ),
   vm_address: hexAddress.nullable(),
   vm_size: z.int().min(0).nullable(),
+  vm_size_hex: hexAddress
+    .optional()
+    .describe(
+      "Exact VM size when it cannot be represented as a safe JSON integer.",
+    ),
   file_offset: z
     .int()
     .min(0)
     .nullable()
     .describe("Offset from the start of the selected Mach-O slice."),
+  file_offset_hex: hexAddress
+    .optional()
+    .describe(
+      "Exact slice-relative file offset when it cannot be represented as a safe JSON integer.",
+    ),
   file_size: z.int().min(0).nullable(),
+  file_size_hex: hexAddress
+    .optional()
+    .describe(
+      "Exact file size when it cannot be represented as a safe JSON integer.",
+    ),
   maximum_permissions: permissionSchema,
   initial_permissions: permissionSchema,
   sections: coverage(sectionSchema),
 });
+/** Derived from `name` by the shared Mach-O symbol-name owner. */
+const runtimeNameSchema = z
+  .string()
+  .nullable()
+  .default(null)
+  .describe(
+    "Symbol-table `name` without the one leading underscore Darwin adds to language-level symbols (`_main` is `main`, `__ZN3rea3addEii` is `_ZN3rea3addEii`), as LLDB and dlsym name it and observe_native_calls function breakpoints accept; a name without that underscore, such as `-[Class selector]`, is unchanged. Null when `name` is null, nothing remains, or the Evidence predates this field.",
+  );
 const symbolSchema = z.object({
+  /** Exact Mach-O symbol-table name, the source fact. */
   name: z.string(),
+  runtime_name: runtimeNameSchema,
   address: hexAddress.nullable(),
   weak: z.boolean().nullable(),
   reexport: z.boolean().nullable(),
@@ -81,6 +135,7 @@ const symbolSchema = z.object({
 const importSymbolSchema = z.object({
   /** Resolved symbol identity; null when the textual row has multiple parses. */
   name: z.string().nullable(),
+  runtime_name: runtimeNameSchema,
   /** Exact import text retained when a chained suffix makes identity ambiguous. */
   raw_name: z.string().nullable().default(null),
   name_status: z.enum(["exact", "ambiguous"]).nullable().default(null),
@@ -92,7 +147,12 @@ const importSymbolSchema = z.object({
   source: z.string().nullable(),
 });
 const dependencySchema = z.object({
-  path: z.string(),
+  path: z.string().nullable(),
+  path_bytes_hex: bytesHex
+    .optional()
+    .describe(
+      "Original load-command path bytes before the first NUL; omitted in older Evidence.",
+    ),
   kind: z.string(),
   current_version: z.string().nullable(),
   compatibility_version: z.string().nullable(),
@@ -100,7 +160,7 @@ const dependencySchema = z.object({
 const loadCommandSchema = z.object({
   index: z.int().min(0),
   kind: z.string(),
-  fields: z.record(z.string(), z.union([z.string(), z.number(), z.null()])),
+  fields: jsonRecordSchema(z.union([z.string(), z.number(), z.null()])),
 });
 const buildMetadataSchema = z.object({
   platform: z.string().nullable(),
