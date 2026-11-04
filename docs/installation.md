@@ -654,6 +654,7 @@ hosted connector; see [its configuration](client-configuration.md#other-client-s
 | Factory Droid      | `droid`          |
 | Trae               | `trae`           |
 | WorkBuddy          | `workbuddy`      |
+| LM Studio          | `lm_studio`      |
 | ZCode              | `zcode`          |
 | DeepSeek Harness   | `dsh`            |
 | FreeBuff           | `freebuff`       |
@@ -662,6 +663,8 @@ hosted connector; see [its configuration](client-configuration.md#other-client-s
 `rea-agents@6.5.0` or later. The 6.4.0 registry check above does not cover them.
 `freebuff` requires `rea-agents@6.8.0` or later. Older releases reject
 `rea setup --client freebuff` as an unsupported client.
+
+`lm_studio` requires a release after 6.8.0.
 
 See [client configuration and troubleshooting](client-configuration.md) for
 configuration paths, profiles, trust policies, and schema-limit workarounds.
@@ -1458,6 +1461,13 @@ Saved REA seed/analyzer reports remain historical facts in retained source Evide
 they are not interpreted as overrides applied by this session.
 Project content participates in snapshot identity, so different project states
 cannot reuse the same profile's cached observations.
+
+If a function selector is missing, use `list_procedures` or `search_procedures`
+to inspect the selected project's observed inventory. A missing entry does not
+prove the function is absent from the executable. To explicitly compare with a
+fresh import, start another REA process without `REA_GHIDRA_PROJECT_PATH` and
+`REA_GHIDRA_PROGRAM_NAME`; the fresh analysis will not include the selected
+project's annotations.
 
 To prepare a new project explicitly, use your existing Ghidra installation in a
 new directory you own (this writes that project; REA does not save it for you):
