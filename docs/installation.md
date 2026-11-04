@@ -378,12 +378,12 @@ a particular caller-supplied input will be valid. See
 
 Select the part you want to check:
 
-| Task                                | Readiness check                                                          |
-| ----------------------------------- | ------------------------------------------------------------------------ |
-| Static JavaScript/Electron analysis | Run `rea analyze-javascript-application PATH --json` directly.           |
-| One analysis engine                 | `rea doctor --provider ghidra --json` (or `hopper`, `ida`, `kuna`)       |
-| One agent registration              | `rea doctor --client codex --json` (see [client IDs](#supported-agents)) |
-| Installed workflow instructions     | `rea doctor --skill --json`                                              |
+| Task                                | Readiness check                                                            |
+| ----------------------------------- | -------------------------------------------------------------------------- |
+| Static JavaScript/Electron analysis | Run `rea analyze-javascript-application PATH --json` directly.             |
+| One analysis engine                 | `rea doctor --provider ghidra --json` (or `hopper`, `ida`, `jadx`, `kuna`) |
+| One agent registration              | `rea doctor --client codex --json` (see [client IDs](#supported-agents))   |
+| Installed workflow instructions     | `rea doctor --skill --json`                                                |
 
 A scoped report has `scope.mode: "explicit"`. Its `scope_checks` determine
 `healthy` and the exit status. Other checks appear in `informational_checks`;
@@ -1160,7 +1160,11 @@ selected formula's `libexec/openjdk.jdk/Contents/Home`, for example
 Java version bounds declared by your Ghidra installation; REA does not select
 another JDK when `JAVA_HOME` is explicit or the PATH JVM runs. On macOS,
 when the PATH launcher cannot start a JVM, it tries executable Homebrew
-`opt/openjdk` candidates, preferring the host architecture's prefix. Failed
+`opt/openjdk` and installed `opt/openjdk@<major>` candidates, preferring the host
+architecture's prefix and the unversioned formula within each prefix. Versioned
+aliases are considered in ascending major order within Ghidra's declared Java
+bounds; the selected executable still undergoes the normal Java probe and
+admission checks. REA does not invoke Homebrew or install a JDK. Failed
 discovery probes remain available in installation diagnostics. Doctor distinguishes an absent Java
 command from a command that runs and fails, and retains bounded probe output
 and any parsed properties when the selected runtime cannot be admitted.

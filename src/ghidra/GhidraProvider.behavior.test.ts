@@ -3,6 +3,12 @@ import {
   EXISTING_PROJECT_WINDOWS_REMEDIATION,
   EXISTING_PROJECT_WINDOWS_UNAVAILABLE,
   existingProjectCapabilities,
+  ghidraEmptyIncomingReferencesLimitation,
+  ghidraEmptyDossierIncomingLimitation,
+  ghidraEmptyExternalOutgoingLimitation,
+  ghidraEmptyInstructionOutgoingLimitation,
+  ghidraEmptyOutgoingReferencesLimitation,
+  ghidraEmptyXrefsLimitation,
 } from "./GhidraProviderCapabilities.js";
 import { AnalysisProviderRegistry } from "../application/binary/AnalysisProviderRegistry.js";
 import { composeBinarySession } from "../application/binary/BinarySessionComposition.js";
@@ -44,6 +50,16 @@ import {
   nativeAotPeVirtualSectionFixture,
 } from "../../tests/fixtures/nativeaotPe.js";
 import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
+import { functionDossierSchema } from "../domain/native/functionDossier.js";
+import {
+  compactInstruction,
+  compactReference,
+} from "../domain/native/nativeInstruction.fixture.js";
+import {
+  ghidraFunctionDossier,
+  ghidraFunctionIdentity,
+  ghidraReferenceEdge,
+} from "../domain/ghidraValues.fixture.js";
 
 import { parseConfig } from "../config/parseConfig.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
@@ -59,7 +75,12 @@ import {
   ghidraStartupTimeoutGuidance,
   type GhidraProviderClientFactory,
 } from "./GhidraProviderClient.js";
-import type { GhidraHeadlessLauncher } from "./GhidraLauncher.js";
+import {
+  GhidraLaunchError,
+  type GhidraHeadlessLauncher,
+} from "./GhidraLauncher.js";
+import { AnalysisArtifactChangedError } from "../domain/analysisErrorCore.js";
+import { GHIDRA_PROJECT_PROFILE_MISMATCH } from "./GhidraProjectSnapshot.js";
 import type { GhidraInstallationHost } from "./GhidraInstallation.js";
 import {
   GHIDRA_MUTATING_OPERATIONS,
@@ -3122,6 +3143,439 @@ const sessionInfo = () => ({
   },
 });
 
+describe("Ghidra empty reference diagnostics", () => {
+  const emptyReferenceProvider = (result: JsonValue) =>
+    provider(installationHost(), () => ({
+      start: () => Promise.resolve(ok(sessionInfo())),
+      callTool: () => Promise.resolve(ok(result)),
+      close: () => Promise.resolve(ok(null)),
+    }));
+
+  const observation = (value: JsonValue) => ({ value, limitations: [] });
+
+  it("names unresolved references in the limitations of an empty xrefs result", async () => {
+    const ghidra = emptyReferenceProvider([]);
+    const client = await createElfClient(ghidra);
+    try {
+      const execution = await client.execute("xrefs", {
+        address: "0x1005409a2",
+      });
+      if (!execution.ok) throw execution.error;
+      expect(execution.value.result).toEqual([]);
+      expect(execution.value.limitations).toContain(ghidraEmptyXrefsLimitation);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("does not add the unresolved-references caveat to a non-empty xrefs result", async () => {
+    const ghidra = emptyReferenceProvider(["0x100003670"]);
+    const client = await createElfClient(ghidra);
+    try {
+      const execution = await client.execute("xrefs", {
+        address: "0x1005409a2",
+      });
+      if (!execution.ok) throw execution.error;
+      expect(execution.value.result).toEqual(["0x100003670"]);
+      expect(execution.value.limitations).not.toContain(
+        ghidraEmptyXrefsLimitation,
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it.each(["incoming", "outgoing"] as const)(
+    "qualifies the empty %s direction in procedure_references limitations",
+    async (direction) => {
+      const ghidra = emptyReferenceProvider(
+        observation({
+          procedure: ghidraFunctionIdentity(),
+          direction,
+          references: [],
+          reference_kinds_available: true,
+          unresolved_calls: [],
+        }),
+      );
+      const client = await createElfClient(ghidra);
+      try {
+        const execution = await client.execute("procedure_references", {
+          procedure: "0x401000",
+          direction,
+        });
+        if (!execution.ok) throw execution.error;
+        expect(execution.value.result).toMatchObject({ references: [] });
+        const expected =
+          direction === "outgoing"
+            ? ghidraEmptyOutgoingReferencesLimitation
+            : ghidraEmptyIncomingReferencesLimitation;
+        const otherDirection =
+          direction === "outgoing"
+            ? ghidraEmptyIncomingReferencesLimitation
+            : ghidraEmptyOutgoingReferencesLimitation;
+        expect(execution.value.limitations).toContain(expected);
+        expect(execution.value.limitations).not.toContain(otherDirection);
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
+  it("does not add the caveat to procedure_references that returned references", async () => {
+    const ghidra = emptyReferenceProvider(
+      observation({
+        procedure: ghidraFunctionIdentity(),
+        direction: "outgoing",
+        references: [ghidraReferenceEdge()],
+        reference_kinds_available: true,
+        unresolved_calls: [],
+      }),
+    );
+    const client = await createElfClient(ghidra);
+    try {
+      const execution = await client.execute("procedure_references", {
+        procedure: "0x401000",
+        direction: "outgoing",
+      });
+      if (!execution.ok) throw execution.error;
+      expect(execution.value.limitations).not.toContain(
+        ghidraEmptyIncomingReferencesLimitation,
+      );
+      expect(execution.value.limitations).not.toContain(
+        ghidraEmptyOutgoingReferencesLimitation,
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("names the external-specific outgoing caveat for an external procedure_references result", async () => {
+    const identity = ghidraFunctionIdentity();
+    const ghidra = emptyReferenceProvider(
+      observation({
+        procedure: {
+          ...identity,
+          classification: { ...identity.classification, external: true },
+        },
+        direction: "outgoing",
+        references: [],
+        reference_kinds_available: true,
+        unresolved_calls: [],
+      }),
+    );
+    const client = await createElfClient(ghidra);
+    try {
+      const execution = await client.execute("procedure_references", {
+        procedure: "0x401000",
+        direction: "outgoing",
+      });
+      if (!execution.ok) throw execution.error;
+      expect(execution.value.limitations).toContain(
+        ghidraEmptyExternalOutgoingLimitation,
+      );
+      expect(execution.value.limitations).not.toContain(
+        ghidraEmptyOutgoingReferencesLimitation,
+      );
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+describe("Ghidra empty function-reference facets", () => {
+  const emptyReferenceProvider = (result: JsonValue) =>
+    provider(installationHost(), () => ({
+      start: () => Promise.resolve(ok(sessionInfo())),
+      callTool: () => Promise.resolve(ok(result)),
+      close: () => Promise.resolve(ok(null)),
+    }));
+
+  const observation = (value: JsonValue) => ({ value, limitations: [] });
+
+  it("names each unresolved direction in the limitations of a dossier without any references", async () => {
+    const dossier = functionDossierSchema.parse(ghidraFunctionDossier());
+    const ghidra = emptyReferenceProvider(
+      observation({
+        ...dossier,
+        incoming_references: [],
+        outgoing_references: [],
+      }),
+    );
+    const client = await createElfClient(ghidra);
+    try {
+      const execution = await client.execute("analyze_function", {
+        procedure: "0x401000",
+      });
+      if (!execution.ok) throw execution.error;
+      expect(execution.value.limitations).toContain(
+        ghidraEmptyDossierIncomingLimitation,
+      );
+      expect(execution.value.limitations).not.toContain(
+        ghidraEmptyIncomingReferencesLimitation,
+      );
+      expect(execution.value.limitations).toContain(
+        ghidraEmptyOutgoingReferencesLimitation,
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("qualifies the empty incoming direction when a dossier observed only outgoing references", async () => {
+    const dossier = functionDossierSchema.parse(ghidraFunctionDossier());
+    const ghidra = emptyReferenceProvider(
+      observation({ ...dossier, incoming_references: [] }),
+    );
+    const client = await createElfClient(ghidra);
+    try {
+      const execution = await client.execute("analyze_function", {
+        procedure: "0x401000",
+      });
+      if (!execution.ok) throw execution.error;
+      expect(execution.value.limitations).toContain(
+        ghidraEmptyDossierIncomingLimitation,
+      );
+      expect(execution.value.limitations).not.toContain(
+        ghidraEmptyIncomingReferencesLimitation,
+      );
+      expect(execution.value.limitations).not.toContain(
+        ghidraEmptyOutgoingReferencesLimitation,
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("qualifies the empty outgoing direction when a dossier observed only incoming references", async () => {
+    const dossier = functionDossierSchema.parse(ghidraFunctionDossier());
+    const ghidra = emptyReferenceProvider(
+      observation({
+        ...dossier,
+        incoming_references: [ghidraReferenceEdge()],
+        outgoing_references: [],
+      }),
+    );
+    const client = await createElfClient(ghidra);
+    try {
+      const execution = await client.execute("analyze_function", {
+        procedure: "0x401000",
+      });
+      if (!execution.ok) throw execution.error;
+      expect(execution.value.limitations).toContain(
+        ghidraEmptyOutgoingReferencesLimitation,
+      );
+      expect(execution.value.limitations).not.toContain(
+        ghidraEmptyDossierIncomingLimitation,
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("qualifies an external function's empty facets without local-disassembly guidance", async () => {
+    const dossier = functionDossierSchema.parse(ghidraFunctionDossier());
+    const ghidra = emptyReferenceProvider(
+      observation({
+        ...dossier,
+        procedure: {
+          ...dossier.procedure,
+          classification: {
+            ...dossier.procedure.classification,
+            external: true,
+          },
+        },
+        incoming_references: [],
+        outgoing_references: [],
+      }),
+    );
+    const client = await createElfClient(ghidra);
+    try {
+      const execution = await client.execute("analyze_function", {
+        procedure: "0x401000",
+      });
+      if (!execution.ok) throw execution.error;
+      expect(execution.value.limitations).toContain(
+        ghidraEmptyIncomingReferencesLimitation,
+      );
+      expect(execution.value.limitations).toContain(
+        ghidraEmptyExternalOutgoingLimitation,
+      );
+      expect(execution.value.limitations).not.toContain(
+        ghidraEmptyDossierIncomingLimitation,
+      );
+      expect(execution.value.limitations).not.toContain(
+        ghidraEmptyOutgoingReferencesLimitation,
+      );
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+describe("Ghidra empty annotation reference facets", () => {
+  const emptyReferenceProvider = (result: JsonValue) =>
+    provider(installationHost(), () => ({
+      start: () => Promise.resolve(ok(sessionInfo())),
+      callTool: () => Promise.resolve(ok(result)),
+      close: () => Promise.resolve(ok(null)),
+    }));
+
+  it("names each unresolved direction when annotation readback observes no references", async () => {
+    const dossier = functionDossierSchema.parse(ghidraFunctionDossier());
+    const ghidra = emptyReferenceProvider({
+      annotations: {
+        address: "0x401000",
+        name: "fixture_main",
+        comment: null,
+        inline_comment: null,
+      },
+      dossier: { ...dossier, incoming_references: [], outgoing_references: [] },
+      effects: {
+        scope: "session-analysis-database",
+        source_bytes_modified: false,
+        persists_after_close: false,
+      },
+    });
+    const client = await createElfClient(ghidra);
+    try {
+      const execution = await client.execute("annotate_native_function", {
+        procedure: "0x401000",
+        name: "fixture_main",
+      });
+      if (!execution.ok) throw execution.error;
+      expect(execution.value.limitations).toContain(
+        ghidraEmptyDossierIncomingLimitation,
+      );
+      expect(execution.value.limitations).toContain(
+        ghidraEmptyOutgoingReferencesLimitation,
+      );
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("qualifies the empty direction when annotation readback observed one direction only", async () => {
+    const dossier = functionDossierSchema.parse(ghidraFunctionDossier());
+    const ghidra = emptyReferenceProvider({
+      annotations: {
+        address: "0x401000",
+        name: "fixture_main",
+        comment: null,
+        inline_comment: null,
+      },
+      dossier: {
+        ...dossier,
+        incoming_references: [ghidraReferenceEdge()],
+        outgoing_references: [],
+      },
+      effects: {
+        scope: "session-analysis-database",
+        source_bytes_modified: false,
+        persists_after_close: false,
+      },
+    });
+    const client = await createElfClient(ghidra);
+    try {
+      const execution = await client.execute("annotate_native_function", {
+        procedure: "0x401000",
+        name: "fixture_main",
+      });
+      if (!execution.ok) throw execution.error;
+      expect(execution.value.limitations).toContain(
+        ghidraEmptyOutgoingReferencesLimitation,
+      );
+      expect(execution.value.limitations).not.toContain(
+        ghidraEmptyIncomingReferencesLimitation,
+      );
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+describe("Ghidra empty instruction reference facets", () => {
+  const emptyReferenceProvider = (result: JsonValue) =>
+    provider(installationHost(), () => ({
+      start: () => Promise.resolve(ok(sessionInfo())),
+      callTool: () => Promise.resolve(ok(result)),
+      close: () => Promise.resolve(ok(null)),
+    }));
+
+  const instruction = (incoming: JsonValue[], outgoing: JsonValue[]) => ({
+    ...compactInstruction(outgoing),
+    incoming_references: incoming,
+  });
+  const nonDecoded = (status: JsonValue, incoming: JsonValue[]) => ({
+    ...compactInstruction(),
+    status,
+    bytes: null,
+    length: null,
+    mnemonic: null,
+    raw_disassembly: null,
+    incoming_references: incoming,
+  });
+  const executeInspect = async (
+    result: JsonValue,
+  ): Promise<readonly string[]> => {
+    const ghidra = emptyReferenceProvider(result);
+    const client = await createElfClient(ghidra);
+    try {
+      const execution = await client.execute("inspect_native_instruction", {
+        document: null,
+        address: "0x401000",
+      });
+      if (!execution.ok) throw execution.error;
+      return execution.value.limitations;
+    } finally {
+      await client.close();
+    }
+  };
+
+  it("names each unresolved facet when neither incoming nor outgoing references were observed", async () => {
+    const limitations = await executeInspect(instruction([], []));
+    expect(limitations).toContain(ghidraEmptyXrefsLimitation);
+    expect(limitations).toContain(ghidraEmptyInstructionOutgoingLimitation);
+  });
+
+  it("qualifies the empty incoming list when only outgoing references were observed", async () => {
+    const limitations = await executeInspect(
+      instruction([], [compactReference()]),
+    );
+    expect(limitations).toContain(ghidraEmptyXrefsLimitation);
+    expect(limitations).not.toContain(ghidraEmptyInstructionOutgoingLimitation);
+  });
+
+  it("qualifies the empty outgoing references when only an incoming list was observed", async () => {
+    const limitations = await executeInspect(
+      instruction([compactReference()], []),
+    );
+    expect(limitations).toContain(ghidraEmptyInstructionOutgoingLimitation);
+    expect(limitations).not.toContain(ghidraEmptyXrefsLimitation);
+  });
+
+  it("adds no caveat when both instruction reference facets observed references", async () => {
+    const limitations = await executeInspect(
+      instruction([compactReference()], [compactReference()]),
+    );
+    expect(limitations).not.toContain(ghidraEmptyXrefsLimitation);
+    expect(limitations).not.toContain(ghidraEmptyInstructionOutgoingLimitation);
+  });
+
+  it("keeps only the address caveat when a data address resolves no incoming references", async () => {
+    const limitations = await executeInspect(nonDecoded("data", []));
+    expect(limitations).toContain(ghidraEmptyXrefsLimitation);
+    expect(limitations).not.toContain(ghidraEmptyInstructionOutgoingLimitation);
+  });
+
+  it("adds no caveat for a data address whose incoming references were observed", async () => {
+    const limitations = await executeInspect(
+      nonDecoded("data", [compactReference()]),
+    );
+    expect(limitations).not.toContain(ghidraEmptyXrefsLimitation);
+    expect(limitations).not.toContain(ghidraEmptyInstructionOutgoingLimitation);
+  });
+});
+
 describe("Ghidra PDB coverage", () => {
   it.each([
     { name: "missing bridge report", pdb: undefined, warns: true },
@@ -3790,6 +4244,79 @@ describe("Ghidra missing project program", () => {
 
   it("keeps the generic start failure for unrelated launch output", async () => {
     const projected = await startFailure("ERROR Unable to lock project");
+    expect(projected.code).toBe("execution_failure");
+  });
+});
+
+describe("Ghidra changed project", () => {
+  const launchFailure = async (cause: unknown) => {
+    const root = await mkdtemp(join(tmpdir(), "rea-changed-project-"));
+    onTestFinished(async () => {
+      await rm(root, { recursive: true, force: true });
+    });
+    await mkdir(join(root, "selected.rep"));
+    await writeFile(join(root, "selected.gpr"), "marker");
+    const failure = new GhidraSessionError(
+      "start",
+      "Ghidra headless launch failed",
+      { failure_kind: "start" },
+      {
+        cause: new GhidraLaunchError("Ghidra headless launch failed", {
+          cause,
+        }),
+      },
+    );
+    const ghidra = provider(
+      installationHost(),
+      () => ({
+        start: async () => err(failure),
+        callTool: async () => err(failure),
+        close: async () => ok(null),
+      }),
+      { REA_GHIDRA_PROJECT_PATH: join(root, "selected.gpr") },
+    );
+    onTestFinished(async () => {
+      await ghidra.closeOwnedResources();
+    });
+    const target = executableTarget("elf", "x86_64");
+    const profile = await ghidra.resolveAnalysisProfile(target);
+    if (!profile.ok || profile.value.profile === null)
+      throw new Error("Expected Ghidra analysis profile");
+    const result = await ghidra
+      .createClient(target, profile.value.profile)
+      .execute("list_documents", {});
+    if (result.ok) throw new Error("Expected a Ghidra start failure");
+    return {
+      error: result.error,
+      projected: projectAnalysisError(result.error),
+    };
+  };
+
+  it("projects a source project changed before its verified copy as artifact_changed", async () => {
+    const path = "/projects/selected";
+    const reason = GHIDRA_PROJECT_PROFILE_MISMATCH;
+    const { error, projected } = await launchFailure(
+      new AnalysisArtifactChangedError("open_binary", path, reason),
+    );
+    expect(projected).toMatchObject({
+      code: "artifact_changed",
+      details: {
+        operation: "list_documents",
+        path,
+        reason,
+        boundary: "stable-artifact-read",
+      },
+    });
+    expect(projected.remediation.action).toBe(
+      projectAnalysisError(
+        new AnalysisArtifactChangedError("list_documents", path, reason),
+      ).remediation.action,
+    );
+    expect(error.cause).toBeInstanceOf(GhidraSessionError);
+  });
+
+  it("keeps the generic start failure for other launch failures", async () => {
+    const { projected } = await launchFailure(new Error("spawn failed"));
     expect(projected.code).toBe("execution_failure");
   });
 });
