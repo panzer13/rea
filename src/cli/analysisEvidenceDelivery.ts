@@ -14,6 +14,7 @@ import {
 import type { JsonValue } from "../domain/jsonValue.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import { EvidenceReferenceError } from "../domain/evidenceErrors.js";
 import { redactExplicitFailure } from "../domain/explicitSensitiveFailure.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { AnalysisInputError } from "../domain/analysisErrorCore.js";
@@ -36,6 +37,8 @@ import {
 import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import type { ZodSafeParseResult } from "zod";
 import { bindCliEvidenceCallerPath } from "./cliEvidenceCallerPath.js";
+import type { AnalysisResultWithSources } from "../application/investigation/recordEvidenceSources.js";
+import { resolveInvestigationEvidenceClosure } from "../application/investigation/InvestigationEvidence.js";
 
 export const analysisEvidenceDeliveryOptions = {
   detail: z
@@ -77,6 +80,42 @@ export const cliEvidenceDeliveryInputError = (
         },
       ])
     : undefined;
+
+/** Resolve only the authenticated Evidence records linked by one CLI result. */
+export const cliEvidenceSourceClosure = (
+  root: Evidence,
+  available: readonly Evidence[],
+): Result<Evidence[], AnalysisError> => {
+  const recordsById = new Map(
+    available.map((record) => [record.evidence_id, record]),
+  );
+  const closure = resolveInvestigationEvidenceClosure(
+    { evidenceForAnalysis: (evidenceId) => recordsById.get(evidenceId) },
+    root.evidence_links,
+  );
+  if (!closure.ok) {
+    if (closure.error instanceof EvidenceReferenceError)
+      return err(
+        new EvidenceReferenceError(
+          closure.error.evidenceId,
+          closure.error.reason,
+          {
+            cause: closure.error,
+            expected: closure.error.expected,
+            actual: closure.error.actual,
+            referenceScope: closure.error.referenceScope,
+            diagnostics: { operation: root.operation },
+          },
+        ),
+      );
+    return err(closure.error);
+  }
+  return ok(
+    closure.value
+      .filter((evidenceId) => evidenceId !== root.evidence_id)
+      .map((evidenceId) => recordsById.get(evidenceId)!),
+  );
+};
 
 /** Parse delivery JSON once and enforce its owning schema before opening a target. */
 export const parseCliAnalysisEvidenceDelivery = <
@@ -207,17 +246,28 @@ const withUndeliveredSourceClosure = (
 
 /** Publish already finalized CLI analysis without opening a second provider/session. */
 export const publishCliAnalysisEvidence = async (
-  result: Result<Evidence, JsonValue>,
+  result: AnalysisResultWithSources<Evidence, JsonValue>,
   input: CliEvidenceDelivery,
 ): Promise<JsonValue> => {
   const { operation, signal, detail, evidenceOutput } = input;
+  // Failure reporting uses the same captured sources as publication. A trace
+  // carries them on the result, while other commands pass them on the input.
+  const capturedSources = [
+    ...(input.sourceEvidence ?? []),
+    ...(result.sourceEvidence ?? []),
+  ];
+  const closureInput =
+    capturedSources.length === 0
+      ? input
+      : { ...input, sourceEvidence: capturedSources };
   const projectFailure = (error: AnalysisError) =>
     projectAnalysisError(
       redactExplicitFailure(error, input.sensitiveValues ?? []),
     );
   const undelivered = (error: AnalysisError) =>
-    withUndeliveredSourceClosure(projectFailure(error), input);
-  if (!result.ok) return withUndeliveredSourceClosure(result.error, input);
+    withUndeliveredSourceClosure(projectFailure(error), closureInput);
+  if (!result.ok)
+    return withUndeliveredSourceClosure(result.error, closureInput);
   const complete = parseEvidence(result.value);
   const inputError = cliEvidenceDeliveryInputError(input);
   if (inputError !== undefined) {
@@ -246,9 +296,10 @@ export const publishCliAnalysisEvidence = async (
   if (!inspectionSources.ok) return undelivered(inspectionSources.error);
   const records = [
     ...new Map(
-      [...(input.sourceEvidence ?? []), ...inspectionSources.value].map(
-        (record) => [record.evidence_id, record],
-      ),
+      [...capturedSources, ...inspectionSources.value].map((record) => [
+        record.evidence_id,
+        record,
+      ]),
     ).values(),
   ];
   // Only skip the writer's heap check when every record is already sealed.
